@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -10,7 +11,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/alexflint/go-arg"
 	"github.com/vishvananda/netlink"
 )
 
@@ -18,22 +18,19 @@ const (
 	GID            = 2354
 	NFQUEUE        = 2034
 	INTERFACE_NAME = "dnsr-wg"
+	APP_VERSION    = "dnsr 5.0.0"
 )
 
 type Args struct {
-	WGConfig   string `arg:"positional" help:"Path to WireGuard configuration file"`
-	Interface  string `arg:"-i,--interface" help:"Use existing WireGuard interface instead of creating new one from config"`
-	ProxyList  string `arg:"--proxy-list" default:"proxy.lst" help:"File with list of domains to proxy through WireGuard(or specified interface)"`
-	BlockList  string `arg:"--block-list" default:"blocks.lst" help:"File with list of domains to block completely"`
-	PresetIPs  string `arg:"--preset-ips" help:"File with IP addresses to proxy immediately, without waiting for DNS resolution"`
-	Force      bool   `arg:"-f,--force" help:"Force remove existing dnsr-wg interface and create new one"`
-	Silent     bool   `arg:"-s,--silent" help:"Don't show when new routes are added"`
-	Verbose    bool   `arg:"-v,--verbose" help:"Enable verbose output for all DNS-answers"`
-	Persistent bool   `arg:"-p,--persistent" help:"Keep WireGuard interface (if created) and routes after exit"`
-}
-
-func (Args) Version() string {
-	return "dnsr 4.0.0"
+	WGConfig   string
+	Interface  string
+	ProxyList  string
+	BlockList  string
+	PresetIPs  string
+	Force      bool
+	Silent     bool
+	Verbose    bool
+	Persistent bool
 }
 
 var (
@@ -42,7 +39,64 @@ var (
 )
 
 func main() {
-	arg.MustParse(&args)
+	flag.StringVar(&args.Interface, "interface", "", "")
+	flag.StringVar(&args.Interface, "i", "", "")
+
+	flag.StringVar(&args.ProxyList, "proxy-list", "proxy.lst", "")
+	flag.StringVar(&args.BlockList, "block-list", "blocks.lst", "")
+	flag.StringVar(&args.PresetIPs, "preset-ips", "", "")
+
+	flag.BoolVar(&args.Force, "force", false, "")
+	flag.BoolVar(&args.Force, "f", false, "")
+
+	flag.BoolVar(&args.Silent, "silent", false, "")
+	flag.BoolVar(&args.Silent, "s", false, "")
+
+	flag.BoolVar(&args.Verbose, "verbose", false, "")
+	flag.BoolVar(&args.Verbose, "v", false, "")
+
+	flag.BoolVar(&args.Persistent, "persistent", false, "")
+	flag.BoolVar(&args.Persistent, "p", false, "")
+
+	showVersion := false
+	flag.BoolVar(&showVersion, "version", false, "")
+
+	flag.Usage = func() {
+		fmt.Printf("%s\n\n", APP_VERSION)
+		fmt.Printf("Usage: %s [options] <WGConfig>\n\n", os.Args[0])
+
+		fmt.Println("Options:")
+		// Используем форматирование %-28s для выравнивания колонки описания
+		printOption("-i, --interface <name>", "Use existing WireGuard interface instead of creating new one")
+		printOption("    --proxy-list <file>", "File with list of domains to proxy (default: proxy.lst)")
+		printOption("    --block-list <file>", "File with list of domains to block (default: blocks.lst)")
+		printOption("    --preset-ips <file>", "File with IP addresses to proxy immediately")
+		printOption("-f, --force", "Force remove existing dnsr-wg interface and create new one")
+		printOption("-s, --silent", "Don't show when new routes are added")
+		printOption("-v, --verbose", "Enable verbose output for all DNS-answers")
+		printOption("-p, --persistent", "Keep WireGuard interface and routes after exit")
+		printOption("    --version", "Show version")
+
+		fmt.Println("\nArguments:")
+		fmt.Printf("  %-28s Path to WireGuard configuration file (required if no -i)\n", "<WGConfig>")
+
+		fmt.Println("\nExamples:")
+		fmt.Println(green("  sudo " + os.Args[0] + " ~/my-wireguard.conf"))
+		fmt.Println(green("  sudo " + os.Args[0] + " --interface wg0 --verbose"))
+		fmt.Println(green("  sudo " + os.Args[0] + " -f -p ~/vpn.conf"))
+	}
+
+	flag.Parse()
+
+	if showVersion {
+		fmt.Println(APP_VERSION)
+		os.Exit(0)
+	}
+
+	// Обработка позиционного аргумента (WGConfig)
+	if flag.NArg() > 0 {
+		args.WGConfig = flag.Arg(0)
+	}
 
 	// Validate
 	if args.WGConfig != "" && args.Interface != "" {
@@ -73,7 +127,7 @@ func main() {
 		log.Print(yellow("Notice: Consider routing your DNS server's IP through VPN too."))
 		log.Print(yellow("Your ISP might block websites by manipulating DNS responses."))
 		log.Print(yellow("You can add DNS server IPs to a file and use --preset-ips option, for example:"))
-		log.Print("  echo '8.8.8.8\\n1.1.1.1' > dns-ips.txt")
+		log.Print("  echo -e '8.8.8.8\\n1.1.1.1' > dns-ips.txt")
 		log.Print("  sudo ./dnsr --preset-ips dns-ips.txt /etc/wireguard/wg0.conf")
 		log.Print("")
 	}
@@ -196,6 +250,10 @@ func main() {
 
 ///////////////////////////////////////////////////////////////////////////////
 
+func printOption(flags, desc string) {
+	fmt.Printf("  %-28s %s\n", flags, desc)
+}
+
 func red(str string) string {
 	return "\033[31m" + str + "\033[0m"
 }
@@ -209,8 +267,8 @@ func yellow(str string) string {
 }
 
 func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return !os.IsNotExist(err)
+	stat, err := os.Stat(path)
+	return !os.IsNotExist(err) && !stat.IsDir()
 }
 
 func execCommand(cmdargs ...string) {

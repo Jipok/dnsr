@@ -46,13 +46,12 @@ func NewRouteCache(capacity int, onEvict EvictCallback) *RouteCache {
 // Add inserts a new IP or updates the freshness of an existing one.
 // Returns true if the IP is new.
 func (c *RouteCache) Add(ip net.IP) bool {
+	// 1. Critical section: Update memory state ONLY
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
-	// Convert net.IP (slice) to [4]byte (array).
-	// This ensures we use a fixed-size stack variable as a map key.
 	ip4 := ip.To4()
 	if ip4 == nil {
+		c.mu.Unlock()
 		return false // Ignore non-IPv4
 	}
 
@@ -61,23 +60,32 @@ func (c *RouteCache) Add(ip net.IP) bool {
 
 	if _, isStatic := c.static[key]; isStatic {
 		// It exists and is pinned. Do not touch LRU order.
+		c.mu.Unlock()
 		return false
 	}
 
-	// Check if IP already exists
 	if ent, ok := c.items[key]; ok {
-		// Move to front (mark as recently used)
 		c.evictList.MoveToFront(ent)
-		return false // Route already exists, no need to touch the kernel
+		c.mu.Unlock()
+		return false // Route exists, update LRU position and return
 	}
 
 	// Add new IP to the front of the list
 	ent := c.evictList.PushFront(key)
 	c.items[key] = ent
 
-	// Check capacity (only counts dynamic entries)
+	// Check capacity. If overflow, remove from map/list but defer the callback.
+	var evictedIP net.IP
 	if c.evictList.Len() > c.capacity {
-		c.removeOldest()
+		evictedIP = c.removeOldest()
+	}
+
+	// Release the lock BEFORE calling the external callback (Netlink I/O)
+	c.mu.Unlock()
+
+	// 2. I/O section: Perform system calls without holding the lock
+	if evictedIP != nil && c.onEvict != nil {
+		c.onEvict(evictedIP)
 	}
 
 	return true
@@ -122,18 +130,15 @@ func (c *RouteCache) AddStatic(ip net.IP) bool {
 }
 
 // removeOldest removes the item at the back of the list (LRU)
-func (c *RouteCache) removeOldest() {
+func (c *RouteCache) removeOldest() net.IP {
 	ent := c.evictList.Back()
 	if ent != nil {
 		c.evictList.Remove(ent)
 		key := ent.Value.([4]byte)
 		delete(c.items, key)
-
-		// Trigger the callback to remove the route from the OS
-		if c.onEvict != nil {
-			c.onEvict(net.IP(key[:]))
-		}
+		return net.IP(key[:])
 	}
+	return nil
 }
 
 // Peek checks if an IP is in the cache without changing its LRU position.
@@ -179,17 +184,25 @@ func (c *RouteCache) Remove(ip net.IP) {
 // FlushCache safely iterates over all items to clean them up
 func (c *RouteCache) FlushCache(callback func(net.IP)) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
+	// Snapshot all IPs that need to be removed
+	ips := make([]net.IP, 0, len(c.items))
 	for key := range c.items {
 		ip := make(net.IP, 4)
 		copy(ip, key[:])
-		callback(ip)
+		ips = append(ips, ip)
 	}
 
 	c.items = make(map[[4]byte]*list.Element)
 	c.static = make(map[[4]byte]struct{})
 	c.evictList.Init()
+
+	c.mu.Unlock()
+
+	// Perform callbacks (Netlink calls) sequentially without blocking cache access for others
+	for _, ip := range ips {
+		callback(ip)
+	}
 }
 
 // Len returns total number of managed routes (static + dynamic)

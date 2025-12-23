@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
@@ -33,6 +34,10 @@ func setupRouting() {
 	c, err = netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
 		log.Fatalf(red("Error:")+" dialing netlink: %v", err)
+	}
+
+	if err := c.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		log.Printf(yellow("Warning:")+" failed to set netlink deadline: %v", err)
 	}
 
 	// 1. Find collisions (analogous to nlListRoutes)
@@ -155,6 +160,8 @@ func (m *rtMessage) MarshalBinary() ([]byte, error) {
 }
 
 func manageRoute(c *netlink.Conn, typeHeader netlink.HeaderType, flags netlink.HeaderFlags, LinkIndex int, ip net.IP) error {
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+
 	ip = ip.To4()
 	if ip == nil {
 		return fmt.Errorf("IPv6 not supported in this snippet")

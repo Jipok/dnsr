@@ -203,14 +203,15 @@ func main() {
 	}
 
 	setupRouting()
-	defer cleanupRouting()
 
 	setupNfqueue()
-	defer removeNfqueue()
 
 	fmt.Println("====================")
 	<-sigChan
 	log.Println("Shutting down...")
+
+	removeNfqueue()
+	cleanupRouting()
 
 	if args.Interface != "" {
 		// Remove MASQUERADE rule

@@ -150,7 +150,9 @@ func addBlockedDomain(domain string) {
 	}
 	if isPattern(domain) {
 		blockedPatterns = append(blockedPatterns, domain)
-		println(domain)
+		if args.Verbose {
+			fmt.Printf("Added block pattern: %s\n", domain)
+		}
 		return
 	}
 	if _, exists := blockedDomains[domain]; !exists {

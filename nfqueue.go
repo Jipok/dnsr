@@ -120,11 +120,12 @@ func removeNfqueue() {
 func processPacket(packet []byte) int {
 	dnsPayload, err := extractUdpPayload(packet)
 	if err != nil {
-		// Not a DNS-answer
+		// Not a DNS-answer or malformed packet
 		if args.Verbose {
 			log.Printf("Received bad DNS-package")
 		}
-		return nfqueue.NfAccept // TODO or drop?
+		// Accept it to avoid breaking non-DNS traffic that might have been caught accidentally
+		return nfqueue.NfAccept
 	}
 	dnsResponse := parseDNSResponse(dnsPayload)
 
@@ -135,6 +136,7 @@ func processPacket(packet []byte) int {
 			if args.Verbose {
 				log.Printf("Blocking DNS-answer for %s", name)
 			}
+			// Ideally, we would send a fake NXDOMAIN response, but that requires more complex packet manipulation.
 			return nfqueue.NfDrop
 		}
 

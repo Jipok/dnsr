@@ -34,9 +34,6 @@ func extractUdpPayload(packet []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invalid IP header length")
 	}
 
-	// srcIP := net.IP(packet[12:16])
-	// println(srcIP.String())
-
 	protocol := packet[9]
 	if protocol != 17 { // Протокол UDP имеет номер 17
 		return nil, fmt.Errorf("not a UDP packet")

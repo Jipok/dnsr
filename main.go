@@ -4,14 +4,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"runtime"
 	"strings"
 	"syscall"
-
-	"github.com/vishvananda/netlink"
 )
 
 const (
@@ -36,6 +35,7 @@ type Args struct {
 var (
 	args   Args
 	useNFT bool
+	link   *net.Interface
 )
 
 func main() {
@@ -196,9 +196,9 @@ func main() {
 	}
 
 	// Check for existing interface
-	link, err = netlink.LinkByName(INTERFACE_NAME)
+	link, err = net.InterfaceByName(INTERFACE_NAME)
 	if err == nil && args.Interface != INTERFACE_NAME {
-		log.Print(yellow("An existing `dnsr-wg` interface was found."))
+		log.Printf(yellow("An existing `%s` interface was found."), INTERFACE_NAME)
 		log.Print(yellow("This could be because:"))
 		log.Print(yellow(" - Previous process was terminated incorrectly"))
 		log.Print(yellow(" - Interface was preserved with --persistent flag"))
@@ -220,7 +220,7 @@ func main() {
 		setupWireguard()
 		defer removeWireguard(false)
 	} else {
-		link, err = netlink.LinkByName(args.Interface)
+		link, err = net.InterfaceByName(args.Interface)
 		if err != nil {
 			log.Fatalf(red("Error:")+" getting `%s` interface: %v", args.Interface, err)
 		}

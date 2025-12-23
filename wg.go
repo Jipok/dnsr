@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/vishvananda/netlink"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
@@ -53,10 +52,7 @@ func removeWireguard(force bool) {
 		} else {
 			execCommand(fmt.Sprintf("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", INTERFACE_NAME))
 		}
-		err := netlink.LinkDel(link)
-		if err != nil {
-			log.Fatalf(red("Error:")+" deleting `%s` interface: %v", args.Interface, err)
-		}
+		execCommand("ip", "link", "delete", INTERFACE_NAME)
 		log.Printf(green("Interface `%s` successfully removed"), INTERFACE_NAME)
 	} else {
 		fmt.Printf(yellow("WireGuard interface '%s' remains active.\n"), INTERFACE_NAME)
@@ -178,31 +174,16 @@ func setupInterface(config *WireguardConfig) error {
 	if args.Verbose {
 		log.Printf("Creating WireGuard interface: %s", INTERFACE_NAME)
 	}
-	attrs := netlink.NewLinkAttrs()
-	attrs.Name = INTERFACE_NAME
-	link = &netlink.GenericLink{
-		LinkAttrs: attrs,
-		LinkType:  "wireguard",
-	}
-	if err := netlink.LinkAdd(link); err != nil {
-		if !isModuleLoaded("wireguard") {
-			log.Print(red("wireguard module not loaded. Run:"))
-			log.Print(green("  modprobe wireguard"))
-		}
-		return fmt.Errorf("failed to create interface: %v", err)
-	}
+	execCommand("modprobe", "wireguard")
+
+	// При использовании нашего execCommand программа умрёт при ошибке, что нам и нужно
+	execCommand("ip", "link", "add", "dev", INTERFACE_NAME, "type", "wireguard")
 
 	// Set IP address
 	if args.Verbose {
 		log.Printf("Setting IP address: %s", config.Address)
 	}
-	addr, err := netlink.ParseAddr(config.Address)
-	if err != nil {
-		return fmt.Errorf("failed to parse address: %v", err)
-	}
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		return fmt.Errorf("failed to set address: %v", err)
-	}
+	execCommand("ip", "addr", "add", config.Address, "dev", INTERFACE_NAME)
 
 	// Create WireGuard client
 	wgClient, err := wgctrl.New()
@@ -278,9 +259,8 @@ func setupInterface(config *WireguardConfig) error {
 	if args.Verbose {
 		log.Printf("Bringing up interface %s", INTERFACE_NAME)
 	}
-	if err := netlink.LinkSetUp(link); err != nil {
-		return fmt.Errorf("failed to bring up interface: %v", err)
-	}
+	// ip link set up dev <NAME>
+	execCommand("ip", "link", "set", "up", "dev", INTERFACE_NAME)
 
 	// Add MASQUERADE rule
 	setUpMasquerade(INTERFACE_NAME)
@@ -307,30 +287,12 @@ func setupInterface(config *WireguardConfig) error {
 	return nil
 }
 
-func isModuleLoaded(moduleName string) bool {
-	content, err := os.ReadFile("/proc/modules")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	scanner := bufio.NewScanner(strings.NewReader(string(content)))
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) > 0 && fields[0] == moduleName {
-			return true
-		}
-	}
-
-	return false
-}
-
 ///////////////////////////////////////////////////////////////////////////////
 
 func setUpMasquerade(name string) {
 	if useNFT {
 		execCommand("nft add table dnsr-nat")
 		execCommand("nft add chain ip dnsr-nat postrouting { type nat hook postrouting priority 100 \\; }")
-		execCommand("nft add table dnsr-nat")
 		execCommand("nft add rule ip dnsr-nat postrouting oifname", name, "masquerade")
 	} else {
 		execCommand(fmt.Sprintf("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE", name))

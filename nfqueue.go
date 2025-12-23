@@ -14,9 +14,8 @@ import (
 )
 
 var (
-	proxyIPset = NewIPv4Set(1000)
-	nf         *nfqueue.Nfqueue
-	nfCancel   context.CancelFunc
+	nf       *nfqueue.Nfqueue
+	nfCancel context.CancelFunc
 )
 
 func setupNfqueue() {
@@ -145,7 +144,7 @@ func processPacket(packet []byte) int {
 		if proxied || checkPatterns(name, proxiedPatterns) != "" {
 			for _, ip := range ipList {
 				if proxyIPset.Add(ip) {
-					go addRoute(ip)
+					addRoute(ip)
 					if !args.Silent {
 						log.Printf("New proxy route %s :: %v", name, ip)
 					}

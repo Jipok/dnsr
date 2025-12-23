@@ -111,7 +111,7 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			log.Printf("Warning: Skipped invalid line (no '='): %s", line)
+			log.Printf(yellow("Warning:")+" Skipped invalid line (no '='): %s", line)
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
@@ -195,7 +195,7 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 				config.I5 = value
 
 			default:
-				log.Printf("Warning: Unknown or unsupported config key in [Interface]: %s", key)
+				log.Printf(yellow("Warning:")+" Unknown or unsupported config key in [Interface]: %s", key)
 			}
 		case "peer":
 			if len(config.Peers) > 0 {
@@ -215,11 +215,11 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 						currentPeer.PersistentKeepalive = ka
 					}
 				default:
-					log.Printf("Warning: Unknown or unsupported config key in [Peer]: %s", key)
+					log.Printf(yellow("Warning:")+"Unknown or unsupported config key in [Peer]: %s", key)
 				}
 			}
 		default:
-			log.Printf("Warning: Key defined outside of [Interface] or [Peer] section: %s", key)
+			log.Printf(yellow("Warning:")+" Key defined outside of [Interface] or [Peer] section: %s", key)
 		}
 	}
 
@@ -437,7 +437,7 @@ func setupInterface(config *WireguardConfig) error {
 		log.Printf("=========================")
 		device, err := wgClient.Device(INTERFACE_NAME)
 		if err != nil {
-			log.Printf("Warning: failed to show configuration: %v", err)
+			log.Printf(yellow("Warning:")+" failed to show configuration: %v", err)
 		} else {
 			log.Printf("Interface: %s", device.Name)
 			log.Printf("  Public key: %s", device.PublicKey.String())

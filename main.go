@@ -1,16 +1,16 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"os/signal"
-	"runtime"
 	"strings"
 	"syscall"
+
+	flag "github.com/spf13/pflag"
 )
 
 const (
@@ -39,61 +39,41 @@ var (
 )
 
 func main() {
-	flag.StringVar(&args.Interface, "interface", "", "")
-	flag.StringVar(&args.Interface, "i", "", "")
+	// Configure flags using pflag
+	flag.StringVarP(&args.Interface, "interface", "i", "", "Use existing WireGuard/Amnezia interface")
 
-	flag.StringVar(&args.ProxyList, "proxy-list", "proxy.lst", "")
-	flag.StringVar(&args.BlockList, "block-list", "blocks.lst", "")
-	flag.StringVar(&args.PresetIPs, "preset-ips", "", "")
+	flag.StringVar(&args.ProxyList, "proxy-list", "proxy.lst", "File with list of domains to proxy")
+	flag.StringVar(&args.BlockList, "block-list", "blocks.lst", "File with list of domains to block")
+	flag.StringVar(&args.PresetIPs, "preset-ips", "", "File with IP addresses to proxy immediately")
 
-	flag.BoolVar(&args.Force, "force", false, "")
-	flag.BoolVar(&args.Force, "f", false, "")
+	flag.BoolVarP(&args.Force, "force", "f", false, "Force remove existing dnsr interface")
+	flag.BoolVarP(&args.Silent, "silent", "s", false, "Don't show when new routes are added")
+	flag.BoolVarP(&args.Verbose, "verbose", "v", false, "Enable verbose output")
+	flag.BoolVarP(&args.Persistent, "persistent", "p", false, "Keep interface (if created) and routes after exit")
 
-	flag.BoolVar(&args.Silent, "silent", false, "")
-	flag.BoolVar(&args.Silent, "s", false, "")
-
-	flag.BoolVar(&args.Verbose, "verbose", false, "")
-	flag.BoolVar(&args.Verbose, "v", false, "")
-
-	flag.BoolVar(&args.Persistent, "persistent", false, "")
-	flag.BoolVar(&args.Persistent, "p", false, "")
-
-	showVersion := false
-	flag.BoolVar(&showVersion, "version", false, "")
+	// Disable sorting to keep logical grouping defined above
+	flag.CommandLine.SortFlags = false
 
 	flag.Usage = func() {
 		fmt.Printf("%s\n\n", APP_VERSION)
-		fmt.Printf("Usage: %s [options] <WGConfig>\n\n", os.Args[0])
+
+		// Improved usage block: shows two distinct modes immediately
+		fmt.Println("Usage:")
+		fmt.Printf("  %s [options] <WG/Amnezia Config>\n", os.Args[0])
+		fmt.Printf("  %s [options] -i <InterfaceName>\n\n", os.Args[0])
 
 		fmt.Println("Options:")
-		// Используем форматирование %-28s для выравнивания колонки описания
-		printOption("-i, --interface <name>", "Use existing WireGuard interface instead of creating new one")
-		printOption("    --proxy-list <file>", "File with list of domains to proxy (default: proxy.lst)")
-		printOption("    --block-list <file>", "File with list of domains to block (default: blocks.lst)")
-		printOption("    --preset-ips <file>", "File with IP addresses to proxy immediately")
-		printOption("-f, --force", "Force remove existing dnsr-wg interface and create new one")
-		printOption("-s, --silent", "Don't show when new routes are added")
-		printOption("-v, --verbose", "Enable verbose output for all DNS-answers")
-		printOption("-p, --persistent", "Keep WG/AWG interface and routes after exit")
-		printOption("    --version", "Show version")
-
-		fmt.Println("\nArguments:")
-		fmt.Printf("  %-28s Path to WireGuard configuration file (required if no -i)\n", "<WGConfig>")
+		flag.PrintDefaults()
 
 		fmt.Println("\nExamples:")
-		fmt.Println(green("  sudo " + os.Args[0] + " ~/my-wireguard.conf"))
-		fmt.Println(green("  sudo " + os.Args[0] + " --interface wg0 --verbose"))
-		fmt.Println(green("  sudo " + os.Args[0] + " -f -p ~/awg.conf"))
+		fmt.Println(green("  sudo " + os.Args[0] + " ~/wg0.conf"))
+		fmt.Println(green("  sudo " + os.Args[0] + " ~/awg.conf --verbose"))
+		fmt.Println(green("  sudo " + os.Args[0] + " -i wg0"))
 	}
 
 	flag.Parse()
 
-	if showVersion {
-		fmt.Println(APP_VERSION)
-		os.Exit(0)
-	}
-
-	// Обработка позиционного аргумента (WGConfig)
+	// Positional argument handling (Config file)
 	if flag.NArg() > 0 {
 		args.WGConfig = flag.Arg(0)
 	}
@@ -103,7 +83,7 @@ func main() {
 		log.Fatal(red("Mutually exclusive options: use either config file or -i flag"))
 	}
 	if args.WGConfig == "" && args.Interface == "" {
-		println(red("Required: ") + "specify either WireGuard config file or existing interface with -i flag")
+		println(red("Required: ") + "specify either WireGuard/Amnezia config file or existing interface with -i flag")
 		println("EXAMPLE:")
 		println(green("  sudo ./dnsr ~/my-wireguard.conf"))
 		println("OR")
@@ -179,17 +159,11 @@ func main() {
 	//
 	readDomains(args.ProxyList, addProxiedDomain)
 	log.Printf("Proxies %d top-level domains, %d globs\n", len(proxiedDomains), len(proxiedPatterns))
-	runtime.GC()
 
 	if fileExists(args.BlockList) {
 		readDomains(args.BlockList, addBlockedDomain)
 		log.Printf("Block %d domains, %d globs\n", len(blockedDomains), len(blockedPatterns))
-		runtime.GC()
 	}
-
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	log.Printf("Total mem usage: %v MiB\n", m.TotalAlloc/1024/1024)
 
 	if args.Silent {
 		fmt.Println("Silent mode, run without -s for verbose output")
@@ -210,8 +184,8 @@ func main() {
 		} else {
 			log.Print(red("To proceed, either:"))
 			log.Print(" - Use --force to remove existing interface and create new one")
-			log.Print(" - Use -i dnsr-wg to use existing interface")
-			log.Fatal(" - Or manually remove interface with: ip link delete dnsr-wg")
+			log.Printf(" - Use -i %s to use existing interface", INTERFACE_NAME)
+			log.Fatalf(" - Or manually remove interface with: ip link delete %s", INTERFACE_NAME)
 		}
 	}
 

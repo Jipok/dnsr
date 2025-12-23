@@ -80,7 +80,7 @@ func parseDNSResponse(dnsPayload []byte) map[string][]net.IP {
 			break
 		}
 		requestedName = qq.Name.String()
-		if err != nil {
+		if err != nil && args.Verbose {
 			fmt.Println("Failed to parse Question:", err)
 			return result
 		}

@@ -16,7 +16,7 @@ import (
 const (
 	GID            = 2354
 	NFQUEUE        = 2034
-	INTERFACE_NAME = "dnsr-wg"
+	INTERFACE_NAME = "dnsr0"
 	APP_VERSION    = "dnsr 5.0.0"
 )
 
@@ -74,7 +74,7 @@ func main() {
 		printOption("-f, --force", "Force remove existing dnsr-wg interface and create new one")
 		printOption("-s, --silent", "Don't show when new routes are added")
 		printOption("-v, --verbose", "Enable verbose output for all DNS-answers")
-		printOption("-p, --persistent", "Keep WireGuard interface and routes after exit")
+		printOption("-p, --persistent", "Keep WG/AWG interface and routes after exit")
 		printOption("    --version", "Show version")
 
 		fmt.Println("\nArguments:")
@@ -83,7 +83,7 @@ func main() {
 		fmt.Println("\nExamples:")
 		fmt.Println(green("  sudo " + os.Args[0] + " ~/my-wireguard.conf"))
 		fmt.Println(green("  sudo " + os.Args[0] + " --interface wg0 --verbose"))
-		fmt.Println(green("  sudo " + os.Args[0] + " -f -p ~/vpn.conf"))
+		fmt.Println(green("  sudo " + os.Args[0] + " -f -p ~/awg.conf"))
 	}
 
 	flag.Parse()

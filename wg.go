@@ -8,23 +8,32 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
-	"golang.zx2c4.com/wireguard/wgctrl"
-	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
+	"github.com/Jipok/wgctrl-go"
+	"github.com/Jipok/wgctrl-go/wgtypes"
 )
 
 type WireguardConfig struct {
 	PrivateKey string
 	Address    string
 	ListenPort int
+	MTU        int
 	Peers      []PeerConfig
+
+	// AmneziaWG Specific Configuration
+	Jc, Jmin, Jmax     int
+	S1, S2, S3, S4     int
+	H1, H2, H3, H4     string
+	I1, I2, I3, I4, I5 string
 }
 
 type PeerConfig struct {
-	PublicKey    string
-	AllowedIPs   string
-	Endpoint     string
-	PresharedKey string
+	PublicKey           string
+	AllowedIPs          string
+	Endpoint            string
+	PresharedKey        string
+	PersistentKeepalive int
 }
 
 func setupWireguard() {
@@ -39,6 +48,11 @@ func setupWireguard() {
 
 	if err := setupInterface(config); err != nil {
 		log.Fatal(err)
+	}
+
+	link, err = net.InterfaceByName(INTERFACE_NAME)
+	if err != nil {
+		log.Fatalf(red("Created interface `%s` could not be found: %v"), INTERFACE_NAME, err)
 	}
 
 	log.Printf(green("Interface `%s` successfully configured"), INTERFACE_NAME)
@@ -79,18 +93,17 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 			log.Printf("Processing line: %s", line)
 		}
 
-		// Пропускаем пустые строки и комментарии
+		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Определяем секцию
+		// Determine section
 		if line == "[Interface]" {
 			section = "interface"
 			continue
 		} else if line == "[Peer]" {
 			section = "peer"
-			// Создаем нового пира и добавляем его в слайс
 			currentPeer = &PeerConfig{}
 			config.Peers = append(config.Peers, *currentPeer)
 			continue
@@ -98,6 +111,7 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
+			log.Printf("Warning: Skipped invalid line (no '='): %s", line)
 			continue
 		}
 		key := strings.TrimSpace(parts[0])
@@ -106,19 +120,84 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 		switch section {
 		case "interface":
 			switch key {
+			// Standard WireGuard Params
 			case "PrivateKey":
 				config.PrivateKey = value
 			case "Address":
 				config.Address = value
+			case "MTU":
+				mtu, err := strconv.Atoi(value)
+				if err == nil {
+					config.MTU = mtu
+				}
 			case "ListenPort":
 				port, err := strconv.Atoi(value)
 				if err != nil {
 					return nil, fmt.Errorf("invalid ListenPort: %v", err)
 				}
 				config.ListenPort = port
+			case "DNS", "PostUp", "PostDown", "PreUp", "PreDown":
+				// Known keys that we explicitly ignore or handle elsewhere/not supported yet
+				if args.Verbose {
+					log.Printf("Info: Ignoring supported but unused key: %s", key)
+				}
+
+			// AmneziaWG Integer Params
+			case "Jc":
+				if v, err := strconv.Atoi(value); err == nil {
+					config.Jc = v
+				}
+			case "Jmin":
+				if v, err := strconv.Atoi(value); err == nil {
+					config.Jmin = v
+				}
+			case "Jmax":
+				if v, err := strconv.Atoi(value); err == nil {
+					config.Jmax = v
+				}
+			case "S1":
+				if v, err := strconv.Atoi(value); err == nil {
+					config.S1 = v
+				}
+			case "S2":
+				if v, err := strconv.Atoi(value); err == nil {
+					config.S2 = v
+				}
+			case "S3":
+				if v, err := strconv.Atoi(value); err == nil {
+					config.S3 = v
+				}
+			case "S4":
+				if v, err := strconv.Atoi(value); err == nil {
+					config.S4 = v
+				}
+
+			// AmneziaWG String Params
+			case "H1":
+				config.H1 = value
+			case "H2":
+				config.H2 = value
+			case "H3":
+				config.H3 = value
+			case "H4":
+				config.H4 = value
+
+			// AmneziaWG Init Packet Magic Params
+			case "I1":
+				config.I1 = value
+			case "I2":
+				config.I2 = value
+			case "I3":
+				config.I3 = value
+			case "I4":
+				config.I4 = value
+			case "I5":
+				config.I5 = value
+
+			default:
+				log.Printf("Warning: Unknown or unsupported config key in [Interface]: %s", key)
 			}
 		case "peer":
-			// Получаем указатель на последнего добавленного пира
 			if len(config.Peers) > 0 {
 				currentPeer = &config.Peers[len(config.Peers)-1]
 				switch key {
@@ -130,8 +209,17 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 					currentPeer.Endpoint = value
 				case "PresharedKey":
 					currentPeer.PresharedKey = value
+				case "PersistentKeepalive":
+					ka, err := strconv.Atoi(value)
+					if err == nil {
+						currentPeer.PersistentKeepalive = ka
+					}
+				default:
+					log.Printf("Warning: Unknown or unsupported config key in [Peer]: %s", key)
 				}
 			}
+		default:
+			log.Printf("Warning: Key defined outside of [Interface] or [Peer] section: %s", key)
 		}
 	}
 
@@ -170,14 +258,29 @@ func validateConfig(config *WireguardConfig) error {
 }
 
 func setupInterface(config *WireguardConfig) error {
-	// Create WireGuard interface
-	if args.Verbose {
-		log.Printf("Creating WireGuard interface: %s", INTERFACE_NAME)
-	}
-	execCommand("modprobe", "wireguard")
+	// Check if config requires AmneziaWG interface
+	isAmnezia := config.Jc > 0 || config.H1 != "" || config.I1 != ""
 
-	// При использовании нашего execCommand программа умрёт при ошибке, что нам и нужно
-	execCommand("ip", "link", "add", "dev", INTERFACE_NAME, "type", "wireguard")
+	interfaceType := "wireguard"
+	if isAmnezia {
+		interfaceType = "amneziawg"
+	}
+
+	// Create Interface
+	if args.Verbose {
+		log.Printf("Creating interface: %s (%s)", INTERFACE_NAME, interfaceType)
+	}
+
+	// Load appropriate kernel module
+	execCommand("modprobe", interfaceType)
+
+	// Create the interface with the determined type
+	execCommand("ip", "link", "add", "dev", INTERFACE_NAME, "type", interfaceType)
+
+	// Set MTU if specified
+	if config.MTU > 0 {
+		execCommand("ip", "link", "set", "dev", INTERFACE_NAME, "mtu", strconv.Itoa(config.MTU))
+	}
 
 	// Set IP address
 	if args.Verbose {
@@ -241,6 +344,11 @@ func setupInterface(config *WireguardConfig) error {
 			peerConfig.PresharedKey = &psk
 		}
 
+		if peer.PersistentKeepalive > 0 {
+			ka := time.Duration(peer.PersistentKeepalive) * time.Second
+			peerConfig.PersistentKeepaliveInterval = &ka
+		}
+
 		peerConfigs[i] = peerConfig
 	}
 
@@ -249,6 +357,65 @@ func setupInterface(config *WireguardConfig) error {
 		PrivateKey: &privateKey,
 		ListenPort: &config.ListenPort,
 		Peers:      peerConfigs,
+	}
+
+	// Apply AmneziaWG parameters if they exist in the config
+	// We check for non-zero/non-empty values before assiging pointers
+
+	// Junk Packet parameters
+	if config.Jc > 0 {
+		deviceConfig.Jc = &config.Jc
+	}
+	if config.Jmin > 0 {
+		deviceConfig.Jmin = &config.Jmin
+	}
+	if config.Jmax > 0 {
+		deviceConfig.Jmax = &config.Jmax
+	}
+
+	// Message Padding parameters
+	if config.S1 > 0 {
+		deviceConfig.S1 = &config.S1
+	}
+	if config.S2 > 0 {
+		deviceConfig.S2 = &config.S2
+	}
+	if config.S3 > 0 {
+		deviceConfig.S3 = &config.S3
+	}
+	if config.S4 > 0 {
+		deviceConfig.S4 = &config.S4
+	}
+
+	// Message Magic Headers
+	if config.H1 != "" {
+		deviceConfig.H1 = &config.H1
+	}
+	if config.H2 != "" {
+		deviceConfig.H2 = &config.H2
+	}
+	if config.H3 != "" {
+		deviceConfig.H3 = &config.H3
+	}
+	if config.H4 != "" {
+		deviceConfig.H4 = &config.H4
+	}
+
+	// Init Packet params
+	if config.I1 != "" {
+		deviceConfig.I1 = &config.I1
+	}
+	if config.I2 != "" {
+		deviceConfig.I2 = &config.I2
+	}
+	if config.I3 != "" {
+		deviceConfig.I3 = &config.I3
+	}
+	if config.I4 != "" {
+		deviceConfig.I4 = &config.I4
+	}
+	if config.I5 != "" {
+		deviceConfig.I5 = &config.I5
 	}
 
 	if err := wgClient.ConfigureDevice(INTERFACE_NAME, deviceConfig); err != nil {

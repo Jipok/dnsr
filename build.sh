@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-export CGO_ENABLED=0 GOOS=windows
+export CGO_ENABLED=0 GOOS=linux
 
 build() {
     local output="dnsr-$1"

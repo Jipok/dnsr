@@ -52,8 +52,11 @@ func setupNfqueue() {
 		return 0
 	}
 
-	err = nf.RegisterWithErrorFunc(ctx, fn, func(e error) int {
-		fmt.Println(err)
+	err = nf.RegisterWithErrorFunc(ctx, fn, func(err error) int {
+		if ctx.Err() != nil {
+			return 0
+		}
+		log.Printf(red("NFQueue error:")+" %v", err)
 		return -1
 	})
 	if err != nil {

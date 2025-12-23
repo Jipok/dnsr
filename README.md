@@ -14,10 +14,10 @@ A simple yet powerful tool that automatically routes your traffic through VPN fo
 - 🌐 **Universal**: Works on both Linux PCs and routers (OpenWrt)
 - 🚀 **Smart Routing**: Only routes specified websites through VPN, keeping other traffic direct
 - ⚡ Lightweight: Minimal resource usage with maximum efficiency
-- 🔧 Built-in WireGuard support (can automatically set up from config)
+- 🔧 Built-in WireGuard and AmneziaWG support (can automatically set up from config)
 - 🛡️ Optional domain blocking
 - 🔄 Auto-cleanup on exit
-- 📝 Support for OpenVPN, WireGuard, or any other network interface
+- 📝 Support for OpenVPN, WireGuard, AmneziaWG, or any other network interface
 
 ## Quick Start (2 Minutes Setup)
 
@@ -31,10 +31,13 @@ A simple yet powerful tool that automatically routes your traffic through VPN fo
    wget https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling/hosts -O blocks.lst
    ```
 
-3. Run with either a WireGuard config or existing interface:
+3. Run with either a VPN config or an existing interface:
    ```bash
    # Using WireGuard config (automatic setup)
    sudo ./dnsr ~/my-wireguard.conf
+
+   # Using AmneziaWG config (automatic setup)
+   sudo ./dnsr ~/my-amnezia.conf
    
    # Or using any existing network interface
    sudo ./dnsr --interface tun0    # OpenVPN interface
@@ -81,7 +84,7 @@ Usage: dnsr [--interface INTERFACE] [--proxy-list PROXY-LIST] [--block-list BLOC
            [--silent] [--verbose] [--no-clear] [WG-CONFIG]
 
 Positional arguments:
-  WG-CONFIG             Path to WireGuard configuration file (optional)
+  WG-CONFIG            Path to WireGuard or AmneziaWG configuration file (optional)
 
 Options:
   --interface, -i      Use existing network interface (OpenVPN, WireGuard, etc.)
@@ -90,7 +93,7 @@ Options:
   --preset-ips         File with IP addresses to proxy immediately, without waiting for DNS resolution
   --silent, -s         Don't show when new routes are added
   --verbose, -v        Enable verbose output
-  --persistent, -p     Keep WireGuard interface (if created) and routes after exit
+  --persistent, -p     Keep WG/AWG interface (if created) and routes after exit
   --help, -h           Show this help message
   --version            Show version
 

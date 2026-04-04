@@ -6,8 +6,8 @@ build() {
     local output="dnsr-$1"
     
     echo ">>> Building $1..."
-    env GOARCH=$1 $2 go build -ldflags '-s -w' -trimpath -o "$output" && \
-    upx --best --lzma "$output" >> /dev/null
+    env GOARCH=$1 $2 go build -ldflags '-s -w' -trimpath -o "$output" #&& \
+    #upx --best --lzma "$output" >> /dev/null
 }
 
 build amd64

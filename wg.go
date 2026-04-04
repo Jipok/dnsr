@@ -94,7 +94,11 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 		}
 
 		// Skip empty lines and comments
-		if line == "" || strings.HasPrefix(line, "#") {
+		if idx := strings.Index(line, "#"); idx != -1 {
+			line = line[:idx]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
 
@@ -458,10 +462,15 @@ func setupInterface(config *WireguardConfig) error {
 
 func setUpMasquerade(name string) {
 	if useNFT {
-		execCommand("nft add table dnsr-nat")
+		execCommand("nft add table ip dnsr-nat")
+		// MASQUERADE
 		execCommand("nft add chain ip dnsr-nat postrouting { type nat hook postrouting priority 100 \\; }")
 		execCommand("nft add rule ip dnsr-nat postrouting oifname", name, "masquerade")
+		// MSS Clamp
+		execCommand("nft add chain ip dnsr-nat mangle_forward { type filter hook forward priority mangle \\; }")
+		execCommand("nft add rule ip dnsr-nat mangle_forward oifname", name, "tcp flags syn tcp option maxseg size set 1340")
 	} else {
 		execCommand(fmt.Sprintf("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE", name))
+		execCommand(fmt.Sprintf("iptables -t mangle -I FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", name))
 	}
 }

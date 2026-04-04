@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -15,40 +16,39 @@ import (
 )
 
 var (
-	c          *netlink.Conn
 	proxyIPset *RouteCache
 )
 
 func setupRouting() {
-	proxyIPset = NewRouteCache(2500, func(ip net.IP) {
-		err := delRoute(ip)
+	proxyIPset = NewRouteCache(2500, func(prefix net.IPNet) {
+		err := delRoute(prefix)
 		if err != nil && !args.Silent {
-			log.Printf("Dropping old route from kernel %s: %v", ip, err)
+			log.Printf("Dropping old route from kernel %s: %v", prefix.String(), err)
 		} else if args.Verbose {
-			log.Printf("Dropping old route from kernel %s", ip)
+			log.Printf("Dropping old route from kernel %s", prefix.String())
 		}
 	})
 
 	// Open connection to NETLINK_ROUTE
-	var err error
-	c, err = netlink.Dial(unix.NETLINK_ROUTE, nil)
+	conn, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
 		log.Fatalf(red("Error:")+" dialing netlink: %v", err)
 	}
+	defer conn.Close()
 
-	if err := c.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
 		log.Printf(yellow("Warning:")+" failed to set netlink deadline: %v", err)
 	}
 
 	// 1. Find collisions (analogous to nlListRoutes)
-	existingIPs, err := listRoutes(c, link.Index)
+	existingPrefixes, err := listRoutes(conn, link.Index)
 	if err != nil {
 		log.Fatalf(red("Error:")+" can't read netlink routes: %v", err)
 		return
 	}
 
-	for _, ip := range existingIPs {
-		proxyIPset.Add(ip)
+	for _, prefix := range existingPrefixes {
+		proxyIPset.AddPrefix(prefix)
 	}
 
 	if proxyIPset.Len() > 0 {
@@ -56,7 +56,7 @@ func setupRouting() {
 	}
 
 	// 2. Load user preset
-	count := 0
+	totalCount := 0
 
 	for _, source := range strings.Split(args.PresetIPs, ";") {
 		source = strings.TrimSpace(source)
@@ -70,6 +70,8 @@ func setupRouting() {
 			continue
 		}
 
+		var batch []routeBatchItem
+
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -81,26 +83,35 @@ func setupRouting() {
 				continue
 			}
 
-			ip := net.ParseIP(line)
-			if ip == nil {
-				continue
+			// Try to interpret as structured CIDR subnet or default purely to isolated IPv4 sets
+			var prefix *net.IPNet
+			_, ipNet, err := net.ParseCIDR(line)
+			if err == nil {
+				prefix = ipNet
+			} else {
+				parsedIP := net.ParseIP(line)
+				if parsedIP == nil || parsedIP.To4() == nil {
+					continue
+				}
+				prefix = &net.IPNet{IP: parsedIP.To4(), Mask: net.CIDRMask(32, 32)}
 			}
 
-			// Add route via open connection
-			if proxyIPset.AddStatic(ip) {
-				if err := addRoute(ip); err == nil {
-					count++
-				} else {
-					proxyIPset.Remove(ip)
-					log.Printf(yellow("Failed to add route %s: %v"), ip, err)
-				}
+			if proxyIPset.AddStaticPrefix(*prefix) {
+				batch = append(batch, routeBatchItem{
+					prefix: *prefix,
+					name:   "`user-preset`",
+				})
 			}
 		}
 		file.Close()
+
+		if len(batch) > 0 {
+			totalCount += addRoutesBatch(batch)
+		}
 	}
 
 	if args.PresetIPs != "" {
-		log.Printf("Routing %d preset IP addresses", count)
+		log.Printf("Loaded %d preset rules from files", totalCount)
 	}
 }
 
@@ -112,27 +123,30 @@ func cleanupRouting() {
 		return
 	}
 
-	proxyIPset.FlushCache(func(ip net.IP) {
-		delRoute(ip)
+	proxyIPset.FlushCache(func(prefix net.IPNet) {
+		delRoute(prefix)
 	})
 
-	c.Close()
 	log.Println(green("Routing cleanup completed"))
 }
 
-func addRoute(ip net.IP) error {
-	return manageRoute(c, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, link.Index, ip)
-}
+// delRoute handles specific IP/CIDR deletion using a dedicated connection
+func delRoute(prefix net.IPNet) error {
+	c, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
+	if err != nil {
+		return fmt.Errorf("dial routes: %w", err)
+	}
+	defer c.Close()
 
-func delRoute(ip net.IP) error {
+	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
+
 	// NLM_F_ACK is sufficient/required for deletion if we want confirmation
-	return manageRoute(c, unix.RTM_DELROUTE, unix.NLM_F_ACK, link.Index, ip)
+	return sendRouteRequest(c, unix.RTM_DELROUTE, unix.NLM_F_ACK, link.Index, prefix)
 }
 
 // --- Logic implementation via mdlayher/netlink ---
 
-// Routing message structure (rtmsg)
-// mdlayher/netlink is just the transport - it doesn't know the route payload structure.
+// mdlayher/netlink is just the transport - it doesn't know the route payload structure
 type rtMessage struct {
 	Family   uint8
 	DstLen   uint8
@@ -143,6 +157,11 @@ type rtMessage struct {
 	Scope    uint8
 	Type     uint8
 	Flags    uint32
+}
+
+type routeBatchItem struct {
+	prefix net.IPNet
+	name   string
 }
 
 func (m *rtMessage) MarshalBinary() ([]byte, error) {
@@ -159,18 +178,64 @@ func (m *rtMessage) MarshalBinary() ([]byte, error) {
 	return b, nil
 }
 
-func manageRoute(c *netlink.Conn, typeHeader netlink.HeaderType, flags netlink.HeaderFlags, LinkIndex int, ip net.IP) error {
-	c.SetDeadline(time.Now().Add(2 * time.Second))
-
-	ip = ip.To4()
-	if ip == nil {
-		return fmt.Errorf("IPv6 not supported in this snippet")
+// addRoutesBatch adds a slice of Subnets/IPs reusing a single netlink connection
+func addRoutesBatch(items []routeBatchItem) int {
+	c, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
+	if err != nil {
+		log.Printf(red("Error:")+" dialing netlink for batch: %v", err)
+		for _, item := range items {
+			proxyIPset.RemovePrefix(item.prefix)
+		}
+		return 0
 	}
+	defer c.Close()
+
+	// Set a reasonable deadline. Adjust if batch sizes are massive
+	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+
+	processed := 0
+	for _, item := range items {
+		// Create | Excl | Ack
+		err := sendRouteRequest(c, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, link.Index, item.prefix)
+		if err == nil {
+			killed := false
+
+			// Only attempt to flush conntrack if the tool is available and flag is not set
+			if !args.NoConntrack {
+				killed, err = killConntrackByDst(item.prefix)
+				if err != nil && args.Verbose {
+					log.Printf(yellow("Conntrack cleanup failed for %s: %v"), item.prefix.String(), err)
+				}
+			}
+
+			if !args.Silent {
+				if killed {
+					log.Printf("New proxy route %s :: %v (killed some connections)", item.name, item.prefix.String())
+				} else {
+					log.Printf("New proxy route %s :: %v", item.name, item.prefix.String())
+				}
+			}
+			processed++
+		} else {
+			proxyIPset.RemovePrefix(item.prefix)
+			log.Printf(yellow("Failed to add route %s: %v"), item.prefix.String(), err)
+		}
+	}
+	return processed
+}
+
+// sendRouteRequest contains the low-level logic to construct and send the message on an existing connection
+func sendRouteRequest(c *netlink.Conn, typeHeader netlink.HeaderType, flags netlink.HeaderFlags, LinkIndex int, prefix net.IPNet) error {
+	ip := prefix.IP.To4()
+	if ip == nil {
+		return fmt.Errorf("IPv6 not supported")
+	}
+	maskLen, _ := prefix.Mask.Size()
 
 	// 1. Create message header (rtmsg)
 	rt := rtMessage{
 		Family:   unix.AF_INET,
-		DstLen:   32, // /32
+		DstLen:   uint8(maskLen),
 		Table:    unix.RT_TABLE_MAIN,
 		Protocol: unix.RTPROT_BOOT,
 		Scope:    unix.RT_SCOPE_UNIVERSE,
@@ -197,16 +262,37 @@ func manageRoute(c *netlink.Conn, typeHeader netlink.HeaderType, flags netlink.H
 		Data: append(rtData, attrs...),
 	}
 
-	// 4. Send and wait for confirmation (Execute does Send + Receive + Validate)
+	// 4. Send and wait for confirmation
 	if _, err := c.Execute(req); err != nil {
-		// We could ignore "File exists" on add or "No such process" on delete here if needed
 		return err
 	}
 
 	return nil
 }
 
-func listRoutes(c *netlink.Conn, linkIndex int) ([]net.IP, error) {
+func killConntrackByDst(dest net.IPNet) (bool, error) {
+	dstStr := dest.String()
+	// Safely fallback for tools misinterpreting basic /32 targets formatted as CIDRs.
+	if ones, _ := dest.Mask.Size(); ones == 32 {
+		dstStr = dest.IP.String()
+	}
+
+	cmd := exec.Command("conntrack", "-D", "-d", dstStr)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		outStr := string(output)
+		// If conntrack exits with status 1, it usually means no entries were found to delete.
+		if strings.Contains(outStr, "0 flow") || strings.Contains(err.Error(), "exit status 1") {
+			return false, nil
+		}
+		return false, fmt.Errorf("%v, output: %s", err, strings.TrimSpace(outStr))
+	}
+
+	return true, nil
+}
+
+func listRoutes(c *netlink.Conn, linkIndex int) ([]net.IPNet, error) {
 	// Request: RTM_GETROUTE + NLM_F_DUMP
 	rt := rtMessage{
 		Family: unix.AF_INET,
@@ -228,7 +314,7 @@ func listRoutes(c *netlink.Conn, linkIndex int) ([]net.IP, error) {
 		return nil, err
 	}
 
-	var res []net.IP
+	var res []net.IPNet
 	for _, m := range msgs {
 		if m.Header.Type != netlink.HeaderType(unix.RTM_NEWROUTE) {
 			continue
@@ -237,6 +323,15 @@ func listRoutes(c *netlink.Conn, linkIndex int) ([]net.IP, error) {
 		// Skip the first 12 bytes (this is the rtmsg struct),
 		// we are interested in the attributes following them.
 		if len(m.Data) < 12 {
+			continue
+		}
+
+		// Grabbing Prefix (CIDR/subnet) Limit applied on exact routes natively
+		dstLen := m.Data[1]
+
+		// Skip system routes
+		protocol := m.Data[5]
+		if protocol == unix.RTPROT_KERNEL {
 			continue
 		}
 
@@ -258,7 +353,7 @@ func listRoutes(c *netlink.Conn, linkIndex int) ([]net.IP, error) {
 		}
 
 		if oif == linkIndex && dst != nil {
-			res = append(res, dst)
+			res = append(res, net.IPNet{IP: dst, Mask: net.CIDRMask(int(dstLen), 32)})
 		}
 	}
 	return res, nil

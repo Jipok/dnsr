@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	flag "github.com/spf13/pflag"
 )
@@ -21,15 +23,16 @@ const (
 )
 
 type Args struct {
-	WGConfig   string
-	Interface  string
-	ProxyList  string
-	BlockList  string
-	PresetIPs  string
-	Force      bool
-	Silent     bool
-	Verbose    bool
-	Persistent bool
+	WGConfig    string
+	Interface   string
+	ProxyList   string
+	BlockList   string
+	PresetIPs   string
+	Force       bool
+	Silent      bool
+	Verbose     bool
+	Persistent  bool
+	NoConntrack bool
 }
 
 var (
@@ -44,12 +47,13 @@ func main() {
 
 	flag.StringVar(&args.ProxyList, "proxy-list", "proxy.lst", "File with list of domains to proxy")
 	flag.StringVar(&args.BlockList, "block-list", "blocks.lst", "File with list of domains to block")
-	flag.StringVar(&args.PresetIPs, "preset-ips", "", "File with IP addresses to proxy immediately")
+	flag.StringVar(&args.PresetIPs, "preset-ips", "ips.lst", "File with IP addresses to proxy immediately")
 
 	flag.BoolVarP(&args.Force, "force", "f", false, "Force remove existing dnsr interface")
 	flag.BoolVarP(&args.Silent, "silent", "s", false, "Don't show when new routes are added")
 	flag.BoolVarP(&args.Verbose, "verbose", "v", false, "Enable verbose output")
 	flag.BoolVarP(&args.Persistent, "persistent", "p", false, "Keep interface (if created) and routes after exit")
+	flag.BoolVar(&args.NoConntrack, "no-conntrack", false, "Disable dropping active connections via conntrack")
 
 	// Disable sorting to keep logical grouping defined above
 	flag.CommandLine.SortFlags = false
@@ -103,17 +107,29 @@ func main() {
 		fmt.Println(green("  wget https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling/hosts -O blocks.lst\n"))
 	}
 
-	if args.PresetIPs == "" && !args.Silent {
-		log.Print(yellow("Notice: Consider routing your DNS server's IP through VPN too."))
-		log.Print(yellow("Your ISP might block websites by manipulating DNS responses."))
-		log.Print(yellow("You can add DNS server IPs to a file and use --preset-ips option, for example:"))
-		log.Print("  echo -e '8.8.8.8\\n1.1.1.1' > dns-ips.txt")
-		log.Print("  sudo ./dnsr --preset-ips dns-ips.txt /etc/wireguard/wg0.conf")
-		log.Print("")
+	if args.PresetIPs == "ips.lst" && !fileExists(args.PresetIPs) {
+		if !args.Silent {
+			log.Print(yellow("Notice: Consider routing CDN IPs (like Cloudflare) and DNS through the VPN."))
+			log.Print(yellow("Many blocked websites are hosted on Cloudflare, and DPI systems often drop these connections."))
+			log.Print(green("  wget https://www.cloudflare.com/ips-v4 -O ips.lst"))
+			log.Print(green("  echo -e '\\n8.8.8.8\\n8.8.4.4\\n1.1.1.1' >> ips.lst\n"))
+		}
+		args.PresetIPs = ""
 	}
 
 	if os.Getuid() != 0 {
 		log.Fatal(red("Must be run as root"))
+	}
+
+	if !args.NoConntrack {
+		if _, err := exec.LookPath("conntrack"); err != nil {
+			log.Println(yellow("Warning! conntrack utility not found. Active connections to newly proxied IPs won't be dropped automatically."))
+			log.Println(yellow("To install it, run: opkg install conntrack (OpenWrt) or apt install conntrack (Debian/Ubuntu)"))
+			// Auto-disable to prevent exec errors on every single route addition
+			args.NoConntrack = true
+		} else if args.Verbose {
+			log.Println("Detected conntrack")
+		}
 	}
 
 	// Detect iptables/nftables
@@ -219,15 +235,12 @@ func main() {
 			execCommand("nft delete table ip dnsr-nat")
 		} else {
 			execCommand(fmt.Sprintf("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", args.Interface))
+			execCommand(fmt.Sprintf("iptables -t mangle -D FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", args.Interface))
 		}
 	}
 }
 
 ///////////////////////////////////////////////////////////////////////////////
-
-func printOption(flags, desc string) {
-	fmt.Printf("  %-28s %s\n", flags, desc)
-}
 
 func red(str string) string {
 	return "\033[31m" + str + "\033[0m"
@@ -247,16 +260,24 @@ func fileExists(path string) bool {
 }
 
 func execCommand(cmdargs ...string) {
-	cmd := strings.Join(cmdargs, " ")
+	cmdStr := strings.Join(cmdargs, " ")
 	if args.Verbose {
-		fmt.Println(yellow("EXEC") + "  " + cmd)
+		fmt.Println(yellow("EXEC") + "  " + cmdStr)
 	}
-	output, err := exec.Command("sh", "-c", cmd).CombinedOutput()
-	if err != nil {
-		if !args.Verbose {
-			fmt.Println(yellow("EXEC") + "  " + cmd)
-		}
-		log.Fatalf(red("%v")+", output: %s \n", err, output)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", cmdStr)
+	output, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		log.Printf(red("EXEC TIMEOUT")+"  %s", cmdStr)
+		return
+	}
+
+	if err != nil && args.Verbose {
+		fmt.Printf(yellow("EXEC ERROR")+" %v, output: %s \n", err, output)
 	}
 }
 

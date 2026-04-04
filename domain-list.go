@@ -60,25 +60,40 @@ func checkPatterns(str string, list []string) string {
 // aboba.ru       -> aboba.ru
 // localhost      -> localhost
 // a.test.co.uk   -> test.co.uk
+// 101.com.ua     -> 101.com.ua
 // api.x.com      -> x.com
-// a.b.c.test.com -> test.com
+// a.b.c.net.ru   -> c.net.ru
 func trimDomain(domain string) string {
 	parts := strings.Split(domain, ".")
+	n := len(parts)
 
-	if len(parts) < 3 {
+	// Если это "localhost" или уже корневой домен "site.com"
+	if n < 3 {
 		return domain
 	}
-	lastTwo := parts[len(parts)-2:]
 
-	// Если предпоследняя часть короче 3 символов (например, "co.uk"), берем три последние части
-	if len(lastTwo[0]) <= 2 && !strings.HasSuffix(domain, ".x.com") {
-		if len(parts) >= 3 {
-			return strings.Join(parts[len(parts)-3:], ".")
+	last := parts[n-1]
+	secLast := parts[n-2]
+
+	isCompound := false
+
+	// Различаем обычные зоны (.com) и составные (.com.ua, .co.uk)
+	// У составных зон (ccTLD) последний элемент — это всегда код страны (2 буквы).
+	// А предпоследний — тип организации.
+	if len(last) == 2 {
+		switch secLast {
+		case "com", "co", "net", "org", "edu", "gov", "ac", "mil", "msk", "spb", "in":
+			isCompound = true
 		}
-		return domain
 	}
 
-	return strings.Join(lastTwo, ".")
+	// Если это составная зона (например, .com.ua), нам нужно 3 части
+	if isCompound {
+		return strings.Join(parts[n-3:], ".")
+	}
+
+	// Для всех остальных (включая .com, .net, .ru, .info) берем последние 2 части
+	return strings.Join(parts[n-2:], ".")
 }
 
 func readDomains(sources string, fn func(domain string)) {
@@ -102,10 +117,10 @@ func readDomains(sources string, fn func(domain string)) {
 				domain = domain[:idx]
 			}
 			domain = strings.TrimSpace(domain)
-			domain, _ = strings.CutPrefix(domain, "https-")
-			domain, _ = strings.CutPrefix(domain, "https.")
-			domain, _ = strings.CutPrefix(domain, "http-")
-			domain, _ = strings.CutPrefix(domain, "http.")
+			// domain, _ = strings.CutPrefix(domain, "https-")
+			// domain, _ = strings.CutPrefix(domain, "https.")
+			// domain, _ = strings.CutPrefix(domain, "http-")
+			// domain, _ = strings.CutPrefix(domain, "http.")
 			domain, _ = strings.CutPrefix(domain, "0.0.0.0 ")
 			domain, _ = strings.CutPrefix(domain, "127.0.0.1 ")
 			domain = strings.TrimSpace(domain)
@@ -126,7 +141,7 @@ func addProxiedDomain(domain string) {
 	pattern := checkPatterns(domain, proxiedPatterns)
 	if pattern != "" {
 		if args.Verbose {
-			fmt.Printf("PROXY: %s  ==  %s\n", pattern, domain)
+			fmt.Printf("SKIP ADD: %s  ==  %s\n", domain, pattern)
 		}
 		return
 	}

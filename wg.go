@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -270,7 +271,6 @@ func setupInterface(config *WireguardConfig) error {
 		interfaceType = "amneziawg"
 	}
 
-	// Create Interface
 	if args.Verbose {
 		log.Printf("Creating interface: %s (%s)", INTERFACE_NAME, interfaceType)
 	}
@@ -278,8 +278,48 @@ func setupInterface(config *WireguardConfig) error {
 	// Load appropriate kernel module
 	execCommand("modprobe", interfaceType)
 
-	// Create the interface with the determined type
-	execCommand("ip", "link", "add", "dev", INTERFACE_NAME, "type", interfaceType)
+	// Attempt to create the interface via kernel (iproute2)
+	cmdStr := fmt.Sprintf("ip link add dev %s type %s", INTERFACE_NAME, interfaceType)
+	cmd := exec.Command("sh", "-c", cmdStr)
+	output, err := cmd.CombinedOutput()
+
+	if err != nil {
+		if isAmnezia {
+			if args.Verbose {
+				log.Printf("Kernel module '%s' not found or unsupported. Trying userspace fallback...", interfaceType)
+			}
+			if !fileExists("amneziawg-go") {
+				fmt.Print(red("AmneziaWG kernel module is missing, and the userspace 'amneziawg-go' alternative was not found.") + "\n" +
+					"There are various solutions:" + "\n" +
+					"1) Download the userspace implementation (Doesn't require kernel modules/DKMS):" + "\n" +
+					green("    wget https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go -O amneziawg-go") + "\n" +
+					green("    chmod +x amneziawg-go") + "\n" +
+					"2) OR install the kernel module" + "\n")
+				os.Exit(1)
+			}
+
+			// Execute userspace implementation. It automatically daemonizes into the background and provides the UAPI socket
+			awgCmd := exec.Command("./amneziawg-go", INTERFACE_NAME)
+			if err := awgCmd.Start(); err != nil {
+				log.Fatalf(red("Failed to start ./amneziawg-go: %v\n"), err)
+			}
+			// Give the background process a moment to initialize
+			time.Sleep(time.Second)
+		} else {
+			// Regular WireGuard failure handling
+			fmt.Printf(red("Failed to create WireGuard interface: %v\n"), err)
+			if args.Verbose {
+				fmt.Printf("Output: %s\n", string(output))
+			}
+			fmt.Print("Your kernel doesn't support direct WireGuard interface creation.\n" +
+				"There are various solutions:\n" +
+				"1) Install the wireguard kernel tools:\n" +
+				green("    sudo apt install wireguard") + "\n" +
+				"2) For routers (OpenWrt):\n" +
+				green("    opkg install wireguard-tools") + "\n")
+			os.Exit(1)
+		}
+	}
 
 	// Set MTU if specified
 	if config.MTU > 0 {

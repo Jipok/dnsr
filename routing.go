@@ -195,6 +195,8 @@ func addRoutesBatch(items []routeBatchItem) int {
 
 	processed := 0
 	for _, item := range items {
+		_ = c.SetDeadline(time.Now().Add(1 * time.Second))
+
 		// Create | Excl | Ack
 		err := sendRouteRequest(c, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, link.Index, item.prefix)
 		if err == nil {

@@ -297,18 +297,28 @@ func setupInterface(config *WireguardConfig) error {
 			if args.Verbose {
 				log.Printf("Kernel module '%s' not found or unsupported. Trying userspace fallback...", interfaceType)
 			}
-			if !fileExists("amneziawg-go") {
-				fmt.Print(red("AmneziaWG kernel module is missing, and the userspace 'amneziawg-go' alternative was not found.") + "\n" +
-					"There are various solutions:" + "\n" +
-					"1) Download the userspace implementation (Doesn't require kernel modules/DKMS):" + "\n" +
-					green("    wget https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go -O amneziawg-go") + "\n" +
-					green("    chmod +x amneziawg-go") + "\n" +
-					"2) OR install the kernel module" + "\n")
-				os.Exit(1)
+
+			// Seek amneziawg-go in $PATH or try in local folder
+			awgBinPath, err := exec.LookPath("amneziawg-go")
+			if err != nil {
+				awgBinPath = "./amneziawg-go"
+				if !fileExists(awgBinPath) && !fileExists("amneziawg-go") {
+					fmt.Print(red("AmneziaWG kernel module is missing, and the userspace 'amneziawg-go' alternative was not found in PATH or locally.") + "\n" +
+						"There are various solutions:" + "\n" +
+						"1) Download the userspace implementation (Doesn't require kernel modules/DKMS):" + "\n" +
+						green("    wget https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go -O amneziawg-go") + "\n" +
+						green("    chmod +x amneziawg-go") + "\n" +
+						"2) OR install the kernel module" + "\n")
+					os.Exit(1)
+				}
+			}
+
+			if args.Verbose {
+				log.Printf("Using userspace implementation at: %s", awgBinPath)
 			}
 
 			// Execute userspace implementation in foreground mode
-			awgCmd := exec.Command("./amneziawg-go", "-f", INTERFACE_NAME)
+			awgCmd := exec.Command(awgBinPath, "-f", INTERFACE_NAME)
 
 			// Ensure the daemon is killed if our main process crashes (Pdeathsig) and put it in its own process group (Setpgid) for clean group kills
 			awgCmd.SysProcAttr = &syscall.SysProcAttr{
@@ -338,7 +348,7 @@ func setupInterface(config *WireguardConfig) error {
 			}()
 
 			if err := awgCmd.Start(); err != nil {
-				log.Fatalf(red("Failed to start ./amneziawg-go: %v\n"), err)
+				log.Fatalf(red("Failed to start amneziawg-go: %v\n"), err)
 			}
 			awgProcess = awgCmd.Process
 
@@ -390,7 +400,7 @@ func setupInterface(config *WireguardConfig) error {
 				}
 
 				fmt.Println("\nTo diagnose, try running it manually:")
-				fmt.Println(green("  sudo ./amneziawg-go -f " + INTERFACE_NAME))
+				fmt.Println(green("  sudo " + awgBinPath + " -f " + INTERFACE_NAME))
 				os.Exit(1)
 			}
 

@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Jipok/wgctrl-go"
@@ -60,6 +64,11 @@ func setupWireguard() {
 }
 
 func removeWireguard(force bool) {
+	if awgProcess != nil {
+		_ = syscall.Kill(-awgProcess.Pid, syscall.SIGTERM)
+		awgProcess = nil
+	}
+
 	if force || !args.Persistent {
 		// Remove MASQUERADE rule
 		if useNFT {
@@ -298,13 +307,96 @@ func setupInterface(config *WireguardConfig) error {
 				os.Exit(1)
 			}
 
-			// Execute userspace implementation. It automatically daemonizes into the background and provides the UAPI socket
-			awgCmd := exec.Command("./amneziawg-go", INTERFACE_NAME)
+			// Execute userspace implementation in foreground mode
+			awgCmd := exec.Command("./amneziawg-go", "-f", INTERFACE_NAME)
+
+			// Ensure the daemon is killed if our main process crashes (Pdeathsig) and put it in its own process group (Setpgid) for clean group kills
+			awgCmd.SysProcAttr = &syscall.SysProcAttr{
+				Pdeathsig: syscall.SIGTERM,
+				Setpgid:   true,
+			}
+
+			// Thread-safe output capturing
+			var awgMu sync.Mutex
+			var awgBuf bytes.Buffer
+			pr, pw := io.Pipe()
+			awgCmd.Stdout = pw
+			awgCmd.Stderr = pw
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					n, err := pr.Read(buf)
+					if n > 0 {
+						awgMu.Lock()
+						awgBuf.Write(buf[:n])
+						awgMu.Unlock()
+					}
+					if err != nil {
+						return
+					}
+				}
+			}()
+
 			if err := awgCmd.Start(); err != nil {
 				log.Fatalf(red("Failed to start ./amneziawg-go: %v\n"), err)
 			}
-			// Give the background process a moment to initialize
-			time.Sleep(time.Second)
+			awgProcess = awgCmd.Process
+
+			// Wait for the process in a background goroutine to prevent zombies
+			procDead := make(chan struct{})
+			go func() {
+				awgCmd.Wait()
+				pw.Close()
+				close(procDead)
+			}()
+
+			//Wwait up to 5 seconds for the interface to appear
+			interfaceCreated := false
+			for i := 0; i < 50; i++ {
+				if _, err := net.InterfaceByName(INTERFACE_NAME); err == nil {
+					interfaceCreated = true
+					break
+				}
+
+				select {
+				case <-procDead:
+					// Process exited before creating the interface
+					i = 50
+				case <-time.After(100 * time.Millisecond):
+					// Continue polling
+				}
+			}
+
+			if !interfaceCreated {
+				fmt.Println(red(fmt.Sprintf("\nError: Interface `%s` was not created by amneziawg-go.", INTERFACE_NAME)))
+
+				// If the process is somehow still hanging, kill it
+				select {
+				case <-procDead:
+					// Already dead, good
+				case <-time.After(100 * time.Millisecond):
+					// Still alive after failure, forcefully terminate its process group
+					syscall.Kill(-awgProcess.Pid, syscall.SIGTERM)
+				}
+				awgProcess = nil
+
+				awgMu.Lock()
+				outputStr := strings.TrimSpace(awgBuf.String())
+				awgMu.Unlock()
+				if outputStr != "" {
+					fmt.Printf(yellow("Daemon output:\n%s\n"), outputStr)
+				} else {
+					fmt.Println(yellow("Notice: No error output captured. This often happens on NixOS due to missing dynamic linkers for downloaded binaries."))
+				}
+
+				fmt.Println("\nTo diagnose, try running it manually:")
+				fmt.Println(green("  sudo ./amneziawg-go -f " + INTERFACE_NAME))
+				os.Exit(1)
+			}
+
+			if args.Verbose {
+				log.Printf("Userspace interface `%s` initialized successfully.", INTERFACE_NAME)
+			}
 		} else {
 			// Regular WireGuard failure handling
 			fmt.Printf(red("Failed to create WireGuard interface: %v\n"), err)

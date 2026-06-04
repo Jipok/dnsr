@@ -19,7 +19,7 @@ const (
 	GID            = 2354
 	NFQUEUE        = 2034
 	INTERFACE_NAME = "dnsr0"
-	APP_VERSION    = "dnsr 5.0.0"
+	APP_VERSION    = "dnsr 5.0.3"
 )
 
 type Args struct {
@@ -36,9 +36,10 @@ type Args struct {
 }
 
 var (
-	args   Args
-	useNFT bool
-	link   *net.Interface
+	args       Args
+	useNFT     bool
+	link       *net.Interface
+	awgProcess *os.Process
 )
 
 func main() {

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -31,6 +32,17 @@ type WireguardConfig struct {
 	S1, S2, S3, S4     int
 	H1, H2, H3, H4     string
 	I1, I2, I3, I4, I5 string
+
+	// 3.0+
+	HeaderProtectionKey  string
+	ContentPadding       wgtypes.UintRange
+	RekeyAfterTime       wgtypes.UintRange
+	RekeyTimeout         wgtypes.UintRange
+	RejectAfterTime      wgtypes.UintRange
+	KeepaliveTimeout     wgtypes.UintRange
+	MaxHandshakeAttempts wgtypes.UintRange
+	RandomTrailers       *bool
+	DisableCookies       *bool
 }
 
 type PeerConfig struct {
@@ -208,6 +220,35 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 			case "I5":
 				config.I5 = value
 
+			// AmneziaWG 3.0+ params
+			case "HeaderProtectionKey":
+				config.HeaderProtectionKey = value
+			case "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts":
+				r, err := wgtypes.ParseUintRange(value)
+				if err != nil {
+					return nil, fmt.Errorf("invalid %s: %v", key, err)
+				}
+				switch key {
+				case "ContentPaddingAddition":
+					config.ContentPadding = r
+				case "RekeyAfterTime":
+					config.RekeyAfterTime = r
+				case "RekeyTimeout":
+					config.RekeyTimeout = r
+				case "RejectAfterTime":
+					config.RejectAfterTime = r
+				case "KeepaliveTimeout":
+					config.KeepaliveTimeout = r
+				case "MaxHandshakeAttempts":
+					config.MaxHandshakeAttempts = r
+				}
+			case "RandomTrailers":
+				v := parseOnOff(value)
+				config.RandomTrailers = &v
+			case "DisableCookies":
+				v := parseOnOff(value)
+				config.DisableCookies = &v
+
 			default:
 				log.Printf(yellow("Warning:")+" Unknown or unsupported config key in [Interface]: %s", key)
 			}
@@ -251,6 +292,14 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 	return config, nil
 }
 
+func parseOnOff(s string) bool {
+	switch strings.ToLower(s) {
+	case "on", "true", "yes", "1":
+		return true
+	}
+	return false
+}
+
 func validateConfig(config *WireguardConfig) error {
 	if config.PrivateKey == "" {
 		return fmt.Errorf("private key is required")
@@ -273,7 +322,11 @@ func validateConfig(config *WireguardConfig) error {
 
 func setupInterface(config *WireguardConfig) error {
 	// Check if config requires AmneziaWG interface
-	isAmnezia := config.Jc > 0 || config.H1 != "" || config.I1 != ""
+	isAmnezia := config.Jc > 0 || config.H1 != "" || config.I1 != "" ||
+		config.HeaderProtectionKey != "" || !config.ContentPadding.IsZero() ||
+		!config.RekeyAfterTime.IsZero() || !config.RekeyTimeout.IsZero() ||
+		!config.RejectAfterTime.IsZero() || !config.KeepaliveTimeout.IsZero() ||
+		!config.MaxHandshakeAttempts.IsZero() || config.RandomTrailers != nil || config.DisableCookies != nil
 
 	interfaceType := "wireguard"
 	if isAmnezia {
@@ -563,6 +616,40 @@ func setupInterface(config *WireguardConfig) error {
 	if config.I5 != "" {
 		deviceConfig.I5 = &config.I5
 	}
+
+	// AmneziaWG 3.0+ params. Header protection needs a 32-byte key, which the
+	// config stores base64-encoded. The ranges are only set when non-zero, so
+	// an older config does not accidentally clear a newer device's settings.
+	if config.HeaderProtectionKey != "" {
+		key, err := base64.StdEncoding.DecodeString(config.HeaderProtectionKey)
+		if err != nil {
+			return fmt.Errorf("invalid HeaderProtectionKey: %v", err)
+		}
+		if len(key) != 32 {
+			return fmt.Errorf("invalid HeaderProtectionKey: expected 32 bytes, got %d", len(key))
+		}
+		deviceConfig.HeaderProtectionKey = (*[32]byte)(key)
+	}
+	if !config.ContentPadding.IsZero() {
+		deviceConfig.ContentPaddingAddition = &config.ContentPadding
+	}
+	if !config.RekeyAfterTime.IsZero() {
+		deviceConfig.RekeyAfterTime = &config.RekeyAfterTime
+	}
+	if !config.RekeyTimeout.IsZero() {
+		deviceConfig.RekeyTimeout = &config.RekeyTimeout
+	}
+	if !config.RejectAfterTime.IsZero() {
+		deviceConfig.RejectAfterTime = &config.RejectAfterTime
+	}
+	if !config.KeepaliveTimeout.IsZero() {
+		deviceConfig.KeepaliveTimeout = &config.KeepaliveTimeout
+	}
+	if !config.MaxHandshakeAttempts.IsZero() {
+		deviceConfig.MaxHandshakeAttempts = &config.MaxHandshakeAttempts
+	}
+	deviceConfig.RandomTrailers = config.RandomTrailers
+	deviceConfig.DisableCookies = config.DisableCookies
 
 	if err := wgClient.ConfigureDevice(INTERFACE_NAME, deviceConfig); err != nil {
 		return fmt.Errorf("failed to configure WireGuard device: %v", err)

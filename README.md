@@ -4,7 +4,7 @@
 > **Major Update (4.0)**: 
 > - Now uses DNS-based routing instead of transparent proxy
 > - Better performance and reliability, especially on routers
-> - If you need SOCKS5 proxy support, use old [v3 release](https://github.com/Jipok/dpi-bypass-proxy/releases/tag/3.0.0)
+> - If you need SOCKS5 proxy support, use old [v3 release](https://github.com/Jipok/dnsr/releases/tag/3.0.0)
 
 A simple yet powerful tool that automatically routes your traffic through VPN for blocked websites while keeping everything else direct. Just download, run, and enjoy unrestricted internet access! Perfect for both personal computers and **routers**.
 
@@ -21,7 +21,7 @@ A simple yet powerful tool that automatically routes your traffic through VPN fo
 
 ## Quick Start (2 Minutes Setup)
 
-1. Download the [latest release](https://github.com/Jipok/dpi-bypass-proxy/releases/latest) or build from source
+1. Download the [latest release](https://github.com/Jipok/dnsr/releases/latest) or build from source
 2. Prepare your domain lists:
    ```bash
    # For proxy list (recommended)
@@ -54,7 +54,7 @@ uname -m    # or
 opkg print-architecture
 ```
 
-2. Download the appropriate binary for your architecture from the [releases page](https://github.com/Jipok/dpi-bypass-proxy/releases/latest).
+2. Download the appropriate binary for your architecture from the [releases page](https://github.com/Jipok/dnsr/releases/latest).
 
 3. The DNSR requires the NFT queue kernel module. Install it using:
 ```bash

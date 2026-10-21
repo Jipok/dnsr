@@ -87,6 +87,7 @@ func removeWireguard(force bool) {
 			execCommand("nft delete table ip dnsr-nat")
 		} else {
 			execCommand(fmt.Sprintf("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", INTERFACE_NAME))
+			execCommand(fmt.Sprintf("iptables -t mangle -D FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", INTERFACE_NAME))
 		}
 		execCommand("ip", "link", "delete", INTERFACE_NAME)
 		log.Printf(green("Interface `%s` successfully removed"), INTERFACE_NAME)

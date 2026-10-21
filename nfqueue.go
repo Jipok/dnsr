@@ -88,13 +88,13 @@ func removeNfqueue() {
 		output, err := exec.Command("sh", "-c", "iptables -L -n -v").Output()
 		if err == nil {
 			if strings.Contains(string(output), "NFQUEUE num "+strconv.Itoa(NFQUEUE)) {
-				execCommand("iptables -D INPUT -p udp --sport 53 -j NFQUEUE --queue-num", strconv.Itoa(NFQUEUE))
-				execCommand("iptables -D FORWARD -p udp --sport 53 -j NFQUEUE --queue-num", strconv.Itoa(NFQUEUE))
-				execCommand("iptables -D OUTPUT -p udp --sport 53 -j NFQUEUE --queue-num", strconv.Itoa(NFQUEUE))
+				execCommand("iptables -D INPUT -p udp --sport 53 -j NFQUEUE --queue-num", strconv.Itoa(NFQUEUE), "--queue-bypass")
+				execCommand("iptables -D FORWARD -p udp --sport 53 -j NFQUEUE --queue-num", strconv.Itoa(NFQUEUE), "--queue-bypass")
+				execCommand("iptables -D OUTPUT -p udp --sport 53 -j NFQUEUE --queue-num", strconv.Itoa(NFQUEUE), "--queue-bypass")
 				log.Printf(green("NFQUEUE `%d` cleanup completed"), NFQUEUE)
-				return
+			} else {
+				log.Printf("NFQUEUE `%d` not found, nothing cleanup", NFQUEUE)
 			}
-			log.Printf("NFQUEUE `%d` not found, nothing cleanup", NFQUEUE)
 		} else {
 			log.Fatal(err)
 		}
@@ -104,9 +104,9 @@ func removeNfqueue() {
 			if strings.Contains(string(output), "dnsr-nf") {
 				execCommand("nft delete table dnsr-nf")
 				log.Printf(green("NFQUEUE `%d` cleanup completed"), NFQUEUE)
-				return
+			} else {
+				log.Printf("NFQUEUE `%d` not found, nothing cleanup", NFQUEUE)
 			}
-			log.Printf("NFQUEUE `%d` not found, nothing cleanup", NFQUEUE)
 		} else {
 			log.Fatal(err)
 		}

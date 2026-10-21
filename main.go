@@ -19,7 +19,7 @@ const (
 	GID            = 2354
 	NFQUEUE        = 2034
 	INTERFACE_NAME = "dnsr0"
-	APP_VERSION    = "dnsr 5.1.0"
+	APP_VERSION    = "dnsr 5.1.1"
 )
 
 type Args struct {

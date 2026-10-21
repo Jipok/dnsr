@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -197,9 +198,9 @@ func addRoutesBatch(items []routeBatchItem) int {
 	for _, item := range items {
 		_ = c.SetDeadline(time.Now().Add(1 * time.Second))
 
-		// Create | Excl | Ack
+		// Create | Excl | Ack. EEXIST means the route is already in place
 		err := sendRouteRequest(c, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, link.Index, item.prefix)
-		if err == nil {
+		if err == nil || errors.Is(err, unix.EEXIST) {
 			killed := false
 
 			// Only attempt to flush conntrack if the tool is available and flag is not set

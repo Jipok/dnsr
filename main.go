@@ -257,7 +257,7 @@ func yellow(str string) string {
 
 func fileExists(path string) bool {
 	stat, err := os.Stat(path)
-	return !os.IsNotExist(err) && !stat.IsDir()
+	return err == nil && !stat.IsDir()
 }
 
 func execCommand(cmdargs ...string) {

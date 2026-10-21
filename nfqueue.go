@@ -23,8 +23,9 @@ func setupNfqueue() {
 	config := nfqueue.Config{
 		NfQueue:      NFQUEUE,
 		MaxPacketLen: 0xFFFF,
-		MaxQueueLen:  0xFF,
+		MaxQueueLen:  0x400,
 		Copymode:     nfqueue.NfQnlCopyPacket,
+		Flags:        nfqueue.NfQaCfgFlagFailOpen,
 		WriteTimeout: 15 * time.Millisecond,
 	}
 
@@ -55,9 +56,14 @@ func setupNfqueue() {
 
 	err = nf.RegisterWithErrorFunc(ctx, fn, func(err error) int {
 		if ctx.Err() != nil {
-			return 0
+			return 1
 		}
 		log.Printf(red("NFQueue error:")+" %v", err)
+		if opError, ok := err.(*nfNetlink.OpError); ok {
+			if opError.Timeout() || opError.Temporary() {
+				return 0
+			}
+		}
 		return -1
 	})
 	if err != nil {

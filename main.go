@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	GID            = 2354
 	NFQUEUE        = 2034
 	INTERFACE_NAME = "dnsr0"
 	APP_VERSION    = "dnsr 5.1.1"
@@ -158,10 +157,6 @@ func main() {
 		log.Println(yellow("Warning! Detected iptables, but may not be active"))
 	} else {
 		log.Fatal(red("Neither iptables nor nftables were found."))
-	}
-
-	if err := syscall.Setgid(GID); err != nil {
-		log.Fatalf(red("Can't change GID: %v\n"), err)
 	}
 
 	// Enable IP forwarding

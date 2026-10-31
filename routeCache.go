@@ -2,6 +2,7 @@ package main
 
 import (
 	"container/list"
+	"encoding/binary"
 	"net"
 	"sync"
 )
@@ -20,18 +21,9 @@ func makeKey(prefix net.IPNet) (cacheKey, bool) {
 
 	ones, _ := prefix.Mask.Size()
 	var key cacheKey
-
-	// Fast path for standard /32 IPs to avoid unnecessary math
-	if ones == 32 {
-		copy(key.ip[:], ip4)
-		key.mask = 32
-		return key, true
-	}
-
-	// Apply bitwise AND with the subnet mask to zero-out host bits
-	mask := net.CIDRMask(ones, 32)
-	for i := 0; i < 4; i++ {
-		key.ip[i] = ip4[i] & mask[i]
+	if ones > 0 {
+		m := uint32(0xFFFFFFFF) << (32 - ones)
+		binary.BigEndian.PutUint32(key.ip[:], binary.BigEndian.Uint32(ip4)&m)
 	}
 	key.mask = uint8(ones)
 
@@ -73,18 +65,11 @@ func NewRouteCache(capacity int, onEvict EvictCallback) *RouteCache {
 }
 
 func (k cacheKey) Contains(ip4 []byte) bool {
-	if k.mask == 32 {
-		// Fast path for exact /32 match
-		return k.ip[0] == ip4[0] && k.ip[1] == ip4[1] && k.ip[2] == ip4[2] && k.ip[3] == ip4[3]
+	if k.mask == 0 {
+		return true
 	}
-
-	mask := net.CIDRMask(int(k.mask), 32)
-	for i := 0; i < 4; i++ {
-		if ip4[i]&mask[i] != k.ip[i]&mask[i] {
-			return false
-		}
-	}
-	return true
+	m := uint32(0xFFFFFFFF) << (32 - k.mask)
+	return binary.BigEndian.Uint32(ip4)&m == binary.BigEndian.Uint32(k.ip[:])
 }
 
 // Add Contains method to verify if an IP resolves into an existing subset coverage

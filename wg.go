@@ -22,7 +22,7 @@ import (
 
 type WireguardConfig struct {
 	PrivateKey string
-	Address    string
+	Address    []string
 	ListenPort int
 	MTU        int
 	Peers      []PeerConfig
@@ -53,46 +53,126 @@ type PeerConfig struct {
 	PersistentKeepalive int
 }
 
-func setupWireguard() {
-	config, err := parseWGConfig(args.WGConfig)
+func findExistingDnsrInterfaces() []string {
+	ifaces, err := net.Interfaces()
 	if err != nil {
-		log.Fatal(err)
+		return nil
+	}
+	var res []string
+	for _, iface := range ifaces {
+		if strings.HasPrefix(iface.Name, "dnsr") {
+			if _, err := strconv.Atoi(strings.TrimPrefix(iface.Name, "dnsr")); err == nil {
+				res = append(res, iface.Name)
+			}
+		}
+	}
+	return res
+}
+
+func setupTunnels() {
+	var ready []*Tunnel
+	for _, t := range tunnels {
+		if t.ConfigPath != "" {
+			if err := setupTunnelWireguard(t); err != nil {
+				log.Printf(red("[%s] Failed to initialize tunnel (%s): %v"), t.Name, t.ConfigPath, err)
+				continue
+			}
+		} else {
+			iface, err := net.InterfaceByName(t.Name)
+			if err != nil {
+				log.Printf(red("[%s] Interface not found: %v"), t.Name, err)
+				continue
+			}
+			t.Link = iface
+			log.Printf(green("Using `%s` interface"), t.Name)
+		}
+		ready = append(ready, t)
+	}
+	if len(ready) == 0 {
+		log.Fatal(red("No tunnel interfaces could be initialized"))
+	}
+	tunnels = ready
+	if len(tunnels) > 1 {
+		// Loose rp_filter: replies to health probes may arrive via a non-active tunnel
+		for _, t := range tunnels {
+			_ = os.WriteFile("/proc/sys/net/ipv4/conf/"+t.Name+"/rp_filter", []byte("2"), 0644)
+		}
+	}
+	setUpMasqueradeAll()
+}
+
+func setupTunnelWireguard(t *Tunnel) error {
+	config, err := parseWGConfig(t.ConfigPath)
+	if err != nil {
+		return err
 	}
 
 	if err := validateConfig(config); err != nil {
-		log.Fatal("Configuration validation failed:", err)
+		return fmt.Errorf("configuration validation failed: %w", err)
 	}
 
-	if err := setupInterface(config); err != nil {
-		log.Fatal(err)
+	if err := setupInterface(t, config); err != nil {
+		killAWG(t)
+		removeInterface(t.Name, true)
+		return err
 	}
 
-	link, err = net.InterfaceByName(INTERFACE_NAME)
+	iface, err := net.InterfaceByName(t.Name)
 	if err != nil {
-		log.Fatalf(red("Created interface `%s` could not be found: %v"), INTERFACE_NAME, err)
+		return fmt.Errorf("created interface `%s` could not be found: %w", t.Name, err)
 	}
+	t.Link = iface
 
-	log.Printf(green("Interface `%s` successfully configured"), INTERFACE_NAME)
+	log.Printf(green("Interface `%s` (%s) successfully configured"), t.Name, t.ConfigPath)
+	return nil
 }
 
-func removeWireguard(force bool) {
-	if awgProcess != nil {
-		_ = syscall.Kill(-awgProcess.Pid, syscall.SIGTERM)
-		awgProcess = nil
+func killAWG(t *Tunnel) {
+	if t.AWGProcess != nil {
+		_ = syscall.Kill(-t.AWGProcess.Pid, syscall.SIGTERM)
+		t.AWGProcess = nil
+	}
+}
+
+// removeInterface drops iptables NAT/MSS rules for the interface (nft table is dropped as a whole)
+// and deletes the interface itself if it was created by dnsr
+func removeInterface(name string, deleteLink bool) {
+	if !useNFT {
+		execCommand(fmt.Sprintf("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", name))
+		execCommand(fmt.Sprintf("iptables -t mangle -D FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", name))
+	}
+	if _, err := net.InterfaceByName(name); err == nil && deleteLink {
+		execCommand("ip", "link", "delete", name)
+		log.Printf(green("Interface `%s` successfully removed"), name)
+	}
+}
+
+func cleanupExistingInterfaces(names []string) {
+	if useNFT {
+		execCommand("nft delete table ip dnsr-nat")
+	}
+	for _, name := range names {
+		removeInterface(name, true)
+	}
+	removeNfqueue()
+}
+
+func removeTunnels() {
+	for _, t := range tunnels {
+		killAWG(t)
 	}
 
-	if force || !args.Persistent {
-		// Remove MASQUERADE rule
-		if useNFT {
-			execCommand("nft delete table ip dnsr-nat")
-		} else {
-			execCommand(fmt.Sprintf("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", INTERFACE_NAME))
-			execCommand(fmt.Sprintf("iptables -t mangle -D FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", INTERFACE_NAME))
+	if args.Persistent {
+		for _, t := range tunnels {
+			fmt.Printf(yellow("WireGuard interface '%s' remains active.\n"), t.Name)
 		}
-		execCommand("ip", "link", "delete", INTERFACE_NAME)
-		log.Printf(green("Interface `%s` successfully removed"), INTERFACE_NAME)
-	} else {
-		fmt.Printf(yellow("WireGuard interface '%s' remains active.\n"), INTERFACE_NAME)
+		return
+	}
+	if useNFT {
+		execCommand("nft delete table ip dnsr-nat")
+	}
+	for _, t := range tunnels {
+		removeInterface(t.Name, t.ConfigPath != "")
 	}
 }
 
@@ -111,10 +191,6 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-
-		if args.Verbose {
-			log.Printf("Processing line: %s", line)
-		}
 
 		// Skip empty lines and comments
 		if idx := strings.Index(line, "#"); idx != -1 {
@@ -144,6 +220,14 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
 
+		if args.Verbose {
+			if key == "PrivateKey" || key == "PresharedKey" || key == "HeaderProtectionKey" {
+				log.Printf("Processing: %s = <redacted>", key)
+			} else {
+				log.Printf("Processing: %s = %s", key, value)
+			}
+		}
+
 		switch section {
 		case "interface":
 			switch key {
@@ -151,7 +235,11 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 			case "PrivateKey":
 				config.PrivateKey = value
 			case "Address":
-				config.Address = value
+				for _, addr := range strings.Split(value, ",") {
+					if addr = strings.TrimSpace(addr); addr != "" {
+						config.Address = append(config.Address, addr)
+					}
+				}
 			case "MTU":
 				mtu, err := strconv.Atoi(value)
 				if err == nil {
@@ -163,8 +251,7 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 					return nil, fmt.Errorf("invalid ListenPort: %v", err)
 				}
 				config.ListenPort = port
-			case "DNS", "PostUp", "PostDown", "PreUp", "PreDown":
-				// Known keys that we explicitly ignore or handle elsewhere/not supported yet
+			case "DNS", "PostUp", "PostDown", "PreUp", "PreDown", "Table", "FwMark":
 				if args.Verbose {
 					log.Printf("Info: Ignoring supported but unused key: %s", key)
 				}
@@ -279,13 +366,6 @@ func parseWGConfig(filename string) (*WireguardConfig, error) {
 		}
 	}
 
-	if args.Verbose {
-		log.Printf("Parsed configuration: %+v", config)
-		for i, peer := range config.Peers {
-			log.Printf("Peer %d: %+v", i, peer)
-		}
-	}
-
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading config: %v", err)
 	}
@@ -305,7 +385,7 @@ func validateConfig(config *WireguardConfig) error {
 	if config.PrivateKey == "" {
 		return fmt.Errorf("private key is required")
 	}
-	if config.Address == "" {
+	if len(config.Address) == 0 {
 		return fmt.Errorf("address is required")
 	}
 
@@ -321,7 +401,9 @@ func validateConfig(config *WireguardConfig) error {
 	return nil
 }
 
-func setupInterface(config *WireguardConfig) error {
+func setupInterface(t *Tunnel, config *WireguardConfig) error {
+	ifName := t.Name
+
 	// Check if config requires AmneziaWG interface
 	isAmnezia := config.Jc > 0 || config.H1 != "" || config.I1 != "" ||
 		config.HeaderProtectionKey != "" || !config.ContentPadding.IsZero() ||
@@ -335,14 +417,14 @@ func setupInterface(config *WireguardConfig) error {
 	}
 
 	if args.Verbose {
-		log.Printf("Creating interface: %s (%s)", INTERFACE_NAME, interfaceType)
+		log.Printf("Creating interface: %s (%s)", ifName, interfaceType)
 	}
 
 	// Load appropriate kernel module
 	execCommand("modprobe", interfaceType)
 
 	// Attempt to create the interface via kernel (iproute2)
-	cmdStr := fmt.Sprintf("ip link add dev %s type %s", INTERFACE_NAME, interfaceType)
+	cmdStr := fmt.Sprintf("ip link add dev %s type %s", ifName, interfaceType)
 	cmd := exec.Command("sh", "-c", cmdStr)
 	output, err := cmd.CombinedOutput()
 
@@ -363,7 +445,7 @@ func setupInterface(config *WireguardConfig) error {
 						green("    wget https://raw.githubusercontent.com/Jipok/jwg/refs/heads/master/amneziawg-go -O amneziawg-go") + "\n" +
 						green("    chmod +x amneziawg-go") + "\n" +
 						"2) OR install the kernel module" + "\n")
-					os.Exit(1)
+					return fmt.Errorf("amneziawg kernel module and amneziawg-go binary are both missing")
 				}
 			}
 
@@ -372,7 +454,7 @@ func setupInterface(config *WireguardConfig) error {
 			}
 
 			// Execute userspace implementation in foreground mode
-			awgCmd := exec.Command(awgBinPath, "-f", INTERFACE_NAME)
+			awgCmd := exec.Command(awgBinPath, "-f", ifName)
 
 			// Ensure the daemon is killed if our main process crashes (Pdeathsig) and put it in its own process group (Setpgid) for clean group kills
 			awgCmd.SysProcAttr = &syscall.SysProcAttr{
@@ -402,9 +484,9 @@ func setupInterface(config *WireguardConfig) error {
 			}()
 
 			if err := awgCmd.Start(); err != nil {
-				log.Fatalf(red("Failed to start amneziawg-go: %v\n"), err)
+				return fmt.Errorf("failed to start amneziawg-go: %w", err)
 			}
-			awgProcess = awgCmd.Process
+			t.AWGProcess = awgCmd.Process
 
 			// Wait for the process in a background goroutine to prevent zombies
 			procDead := make(chan struct{})
@@ -414,10 +496,10 @@ func setupInterface(config *WireguardConfig) error {
 				close(procDead)
 			}()
 
-			//Wwait up to 5 seconds for the interface to appear
+			// Wait up to 5 seconds for the interface to appear
 			interfaceCreated := false
 			for i := 0; i < 50; i++ {
-				if _, err := net.InterfaceByName(INTERFACE_NAME); err == nil {
+				if _, err := net.InterfaceByName(ifName); err == nil {
 					interfaceCreated = true
 					break
 				}
@@ -432,7 +514,7 @@ func setupInterface(config *WireguardConfig) error {
 			}
 
 			if !interfaceCreated {
-				fmt.Println(red(fmt.Sprintf("\nError: Interface `%s` was not created by amneziawg-go.", INTERFACE_NAME)))
+				fmt.Println(red(fmt.Sprintf("\nError: Interface `%s` was not created by amneziawg-go.", ifName)))
 
 				// If the process is somehow still hanging, kill it
 				select {
@@ -440,9 +522,9 @@ func setupInterface(config *WireguardConfig) error {
 					// Already dead, good
 				case <-time.After(100 * time.Millisecond):
 					// Still alive after failure, forcefully terminate its process group
-					syscall.Kill(-awgProcess.Pid, syscall.SIGTERM)
+					syscall.Kill(-t.AWGProcess.Pid, syscall.SIGTERM)
 				}
-				awgProcess = nil
+				t.AWGProcess = nil
 
 				awgMu.Lock()
 				outputStr := strings.TrimSpace(awgBuf.String())
@@ -454,12 +536,12 @@ func setupInterface(config *WireguardConfig) error {
 				}
 
 				fmt.Println("\nTo diagnose, try running it manually:")
-				fmt.Println(green("  sudo " + awgBinPath + " -f " + INTERFACE_NAME))
-				os.Exit(1)
+				fmt.Println(green("  sudo " + awgBinPath + " -f " + ifName))
+				return fmt.Errorf("interface `%s` was not created by amneziawg-go", ifName)
 			}
 
 			if args.Verbose {
-				log.Printf("Userspace interface `%s` initialized successfully.", INTERFACE_NAME)
+				log.Printf("Userspace interface `%s` initialized successfully.", ifName)
 			}
 		} else {
 			// Regular WireGuard failure handling
@@ -473,20 +555,26 @@ func setupInterface(config *WireguardConfig) error {
 				green("    sudo apt install wireguard") + "\n" +
 				"2) For routers (OpenWrt):\n" +
 				green("    opkg install wireguard-tools") + "\n")
-			os.Exit(1)
+			return fmt.Errorf("failed to create WireGuard interface %s: %w", ifName, err)
 		}
 	}
 
 	// Set MTU if specified
 	if config.MTU > 0 {
-		execCommand("ip", "link", "set", "dev", INTERFACE_NAME, "mtu", strconv.Itoa(config.MTU))
+		execCommand("ip", "link", "set", "dev", ifName, "mtu", strconv.Itoa(config.MTU))
 	}
 
-	// Set IP address
+	// Set IP address(es)
 	if args.Verbose {
-		log.Printf("Setting IP address: %s", config.Address)
+		log.Printf("Setting IP address on %s: %s", ifName, config.Address)
 	}
-	execCommand("ip", "addr", "add", config.Address, "dev", INTERFACE_NAME)
+	for _, addr := range config.Address {
+		execCommand("ip", "addr", "add", addr, "dev", ifName)
+		ip, _, _ := strings.Cut(addr, "/")
+		if parsed := net.ParseIP(ip); parsed != nil && parsed.To4() != nil && t.AddressIP == "" {
+			t.AddressIP = ip
+		}
+	}
 
 	// Create WireGuard client
 	wgClient, err := wgctrl.New()
@@ -559,9 +647,6 @@ func setupInterface(config *WireguardConfig) error {
 		Peers:      peerConfigs,
 	}
 
-	// Apply AmneziaWG parameters if they exist in the config
-	// We check for non-zero/non-empty values before assiging pointers
-
 	// Junk Packet parameters
 	if config.Jc > 0 {
 		deviceConfig.Jc = &config.Jc
@@ -618,9 +703,7 @@ func setupInterface(config *WireguardConfig) error {
 		deviceConfig.I5 = &config.I5
 	}
 
-	// AmneziaWG 3.0+ params. Header protection needs a 32-byte key, which the
-	// config stores base64-encoded. The ranges are only set when non-zero, so
-	// an older config does not accidentally clear a newer device's settings.
+	// AmneziaWG 3.0+ params
 	if config.HeaderProtectionKey != "" {
 		key, err := base64.StdEncoding.DecodeString(config.HeaderProtectionKey)
 		if err != nil {
@@ -652,24 +735,26 @@ func setupInterface(config *WireguardConfig) error {
 	deviceConfig.RandomTrailers = config.RandomTrailers
 	deviceConfig.DisableCookies = config.DisableCookies
 
-	if err := wgClient.ConfigureDevice(INTERFACE_NAME, deviceConfig); err != nil {
+	if err := wgClient.ConfigureDevice(ifName, deviceConfig); err != nil {
 		return fmt.Errorf("failed to configure WireGuard device: %v", err)
+	}
+
+	for _, p := range peerConfigs {
+		if p.Endpoint != nil {
+			registerEndpointIP(p.Endpoint.IP)
+		}
 	}
 
 	// Bring up interface
 	if args.Verbose {
-		log.Printf("Bringing up interface %s", INTERFACE_NAME)
+		log.Printf("Bringing up interface %s", ifName)
 	}
-	// ip link set up dev <NAME>
-	execCommand("ip", "link", "set", "up", "dev", INTERFACE_NAME)
-
-	// Add MASQUERADE rule
-	setUpMasquerade(INTERFACE_NAME)
+	execCommand("ip", "link", "set", "up", "dev", ifName)
 
 	// Display final configuration
 	if args.Verbose {
 		log.Printf("=========================")
-		device, err := wgClient.Device(INTERFACE_NAME)
+		device, err := wgClient.Device(ifName)
 		if err != nil {
 			log.Printf(yellow("Warning:")+" failed to show configuration: %v", err)
 		} else {
@@ -690,17 +775,19 @@ func setupInterface(config *WireguardConfig) error {
 
 ///////////////////////////////////////////////////////////////////////////////
 
-func setUpMasquerade(name string) {
+func setUpMasqueradeAll() {
 	if useNFT {
 		execCommand("nft add table ip dnsr-nat")
-		// MASQUERADE
 		execCommand("nft add chain ip dnsr-nat postrouting { type nat hook postrouting priority 100 \\; }")
-		execCommand("nft add rule ip dnsr-nat postrouting oifname", name, "masquerade")
-		// MSS Clamp
 		execCommand("nft add chain ip dnsr-nat mangle_forward { type filter hook forward priority mangle \\; }")
-		execCommand("nft add rule ip dnsr-nat mangle_forward oifname", name, "tcp flags syn tcp option maxseg size set 1340")
+		for _, t := range tunnels {
+			execCommand("nft add rule ip dnsr-nat postrouting oifname", t.Name, "masquerade")
+			execCommand("nft add rule ip dnsr-nat mangle_forward oifname", t.Name, "tcp flags syn tcp option maxseg size set 1340")
+		}
 	} else {
-		execCommand(fmt.Sprintf("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE", name))
-		execCommand(fmt.Sprintf("iptables -t mangle -I FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", name))
+		for _, t := range tunnels {
+			execCommand(fmt.Sprintf("iptables -t nat -A POSTROUTING -o %s -j MASQUERADE", t.Name))
+			execCommand(fmt.Sprintf("iptables -t mangle -I FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", t.Name))
+		}
 	}
 }

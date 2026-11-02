@@ -114,7 +114,7 @@ func (c *RouteCache) Add(ip net.IP) bool {
 	c.mu.Lock()
 
 	ip4 := ip.To4()
-	if ip4 == nil {
+	if ip4 == nil || !ip4.IsGlobalUnicast() {
 		c.mu.Unlock()
 		return false
 	}

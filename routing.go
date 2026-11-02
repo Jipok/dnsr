@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/mdlayher/netlink"
@@ -17,7 +20,11 @@ import (
 )
 
 var (
-	proxyIPset *RouteCache
+	proxyIPset   *RouteCache
+	netlinkMu    sync.Mutex
+	activeTunnel *Tunnel
+	endpointIPs  []net.IP
+	probeHosts   = []string{"8.8.4.4", "1.0.0.1"}
 )
 
 func setupRouting() {
@@ -29,6 +36,29 @@ func setupRouting() {
 			log.Printf("Dropping old route from kernel %s", prefix.String())
 		}
 	})
+
+	activeTunnel = tunnels[0]
+	if len(tunnels) > 1 {
+		log.Printf("Probing %d tunnels to select initial active interface...", len(tunnels))
+		selected := false
+		for _, t := range tunnels {
+			status := red("DOWN")
+			if probeTunnel(context.Background(), t, args.CheckTimeout) {
+				status = green("UP")
+				if !selected {
+					activeTunnel = t
+					selected = true
+				}
+			}
+			log.Printf("  Tunnel %s (%s): %s", t.Name, tunnelLabel(t), status)
+		}
+		if !selected {
+			log.Printf(yellow("Warning: no tunnel answered initial probe, defaulting to %s (%s)"),
+				activeTunnel.Name, tunnelLabel(activeTunnel))
+		} else {
+			log.Printf(green("Selected active tunnel: %s (%s)"), activeTunnel.Name, tunnelLabel(activeTunnel))
+		}
+	}
 
 	// Open connection to NETLINK_ROUTE
 	conn, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
@@ -42,14 +72,19 @@ func setupRouting() {
 	}
 
 	// 1. Find collisions (analogous to nlListRoutes)
-	existingPrefixes, err := listRoutes(conn, link.Index)
-	if err != nil {
-		log.Fatalf(red("Error:")+" can't read netlink routes: %v", err)
-		return
-	}
-
-	for _, prefix := range existingPrefixes {
-		proxyIPset.AddPrefix(prefix)
+	for _, t := range tunnels {
+		existingPrefixes, err := listRoutes(conn, t.Link.Index)
+		if err != nil {
+			log.Fatalf(red("Error:")+" can't read netlink routes: %v", err)
+			return
+		}
+		for _, prefix := range existingPrefixes {
+			proxyIPset.AddPrefix(prefix)
+			if t != activeTunnel {
+				_ = conn.SetDeadline(time.Now().Add(1 * time.Second))
+				_ = sendRouteRequest(conn, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_REPLACE|unix.NLM_F_ACK, activeTunnel.Link.Index, prefix)
+			}
+		}
 	}
 
 	if proxyIPset.Len() > 0 {
@@ -88,10 +123,15 @@ func setupRouting() {
 			var prefix *net.IPNet
 			_, ipNet, err := net.ParseCIDR(line)
 			if err == nil {
+				ones, bits := ipNet.Mask.Size()
+				if ipNet.IP.To4() == nil || bits != 32 || ones == 0 || !ipNet.IP.To4().IsGlobalUnicast() {
+					continue
+				}
+				ipNet.IP = ipNet.IP.To4()
 				prefix = ipNet
 			} else {
 				parsedIP := net.ParseIP(line)
-				if parsedIP == nil || parsedIP.To4() == nil {
+				if parsedIP == nil || parsedIP.To4() == nil || !parsedIP.To4().IsGlobalUnicast() {
 					continue
 				}
 				prefix = &net.IPNet{IP: parsedIP.To4(), Mask: net.CIDRMask(32, 32)}
@@ -133,6 +173,9 @@ func cleanupRouting() {
 
 // delRoute handles specific IP/CIDR deletion using a dedicated connection
 func delRoute(prefix net.IPNet) error {
+	netlinkMu.Lock()
+	defer netlinkMu.Unlock()
+
 	c, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
 		return fmt.Errorf("dial routes: %w", err)
@@ -141,8 +184,9 @@ func delRoute(prefix net.IPNet) error {
 
 	_ = c.SetDeadline(time.Now().Add(500 * time.Millisecond))
 
-	// NLM_F_ACK is sufficient/required for deletion if we want confirmation
-	return sendRouteRequest(c, unix.RTM_DELROUTE, unix.NLM_F_ACK, link.Index, prefix)
+	// All our routes live on the active tunnel (switchActiveTunnel moves them under netlinkMu),
+	// so keep RTA_OIF to never delete a foreign route with the same prefix
+	return sendRouteRequest(c, unix.RTM_DELROUTE, unix.NLM_F_ACK, activeTunnel.Link.Index, prefix)
 }
 
 // --- Logic implementation via mdlayher/netlink ---
@@ -181,50 +225,55 @@ func (m *rtMessage) MarshalBinary() ([]byte, error) {
 
 // addRoutesBatch adds a slice of Subnets/IPs reusing a single netlink connection
 func addRoutesBatch(items []routeBatchItem) int {
+	netlinkMu.Lock()
 	c, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
 	if err != nil {
+		netlinkMu.Unlock()
 		log.Printf(red("Error:")+" dialing netlink for batch: %v", err)
 		for _, item := range items {
 			proxyIPset.RemovePrefix(item.prefix)
 		}
 		return 0
 	}
-	defer c.Close()
 
-	// Set a reasonable deadline. Adjust if batch sizes are massive
-	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-
-	processed := 0
+	linkIdx := activeTunnel.Link.Index
+	var added []routeBatchItem
 	for _, item := range items {
+		if overlapsEndpoint(item.prefix) {
+			proxyIPset.RemovePrefix(item.prefix)
+			log.Printf(yellow("Skipping route %s because it overlaps VPN endpoint"), item.prefix.String())
+			continue
+		}
 		_ = c.SetDeadline(time.Now().Add(1 * time.Second))
-
-		// Create | Excl | Ack. EEXIST means the route is already in place
-		err := sendRouteRequest(c, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, link.Index, item.prefix)
+		err := sendRouteRequest(c, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK, linkIdx, item.prefix)
 		if err == nil || errors.Is(err, unix.EEXIST) {
-			killed := false
-
-			// Only attempt to flush conntrack if the tool is available and flag is not set
-			if !args.NoConntrack {
-				killed, err = killConntrackByDst(item.prefix)
-				if err != nil && args.Verbose {
-					log.Printf(yellow("Conntrack cleanup failed for %s: %v"), item.prefix.String(), err)
-				}
-			}
-
-			if !args.Silent {
-				if killed {
-					log.Printf("New proxy route %s :: %v (killed some connections)", item.name, item.prefix.String())
-				} else {
-					log.Printf("New proxy route %s :: %v", item.name, item.prefix.String())
-				}
-			}
-			processed++
+			added = append(added, item)
 		} else {
 			proxyIPset.RemovePrefix(item.prefix)
 			log.Printf(yellow("Failed to add route %s: %v"), item.prefix.String(), err)
 		}
 	}
-	return processed
+	c.Close()
+	netlinkMu.Unlock()
+
+	for _, item := range added {
+		killed := false
+		if !args.NoConntrack {
+			var err error
+			killed, err = killConntrackByDst(item.prefix)
+			if err != nil && args.Verbose {
+				log.Printf(yellow("Conntrack cleanup failed for %s: %v"), item.prefix.String(), err)
+			}
+		}
+		if !args.Silent {
+			if killed {
+				log.Printf("New proxy route %s :: %v (killed some connections)", item.name, item.prefix.String())
+			} else {
+				log.Printf("New proxy route %s :: %v", item.name, item.prefix.String())
+			}
+		}
+	}
+	return len(added)
 }
 
 // sendRouteRequest contains the low-level logic to construct and send the message on an existing connection
@@ -249,7 +298,9 @@ func sendRouteRequest(c *netlink.Conn, typeHeader netlink.HeaderType, flags netl
 	// 2. Encode attributes (RTA_DST, RTA_OIF)
 	ae := netlink.NewAttributeEncoder()
 	ae.Bytes(unix.RTA_DST, ip)
-	ae.Uint32(unix.RTA_OIF, uint32(LinkIndex))
+	if LinkIndex > 0 {
+		ae.Uint32(unix.RTA_OIF, uint32(LinkIndex))
+	}
 
 	attrs, err := ae.Encode()
 	if err != nil {
@@ -280,7 +331,10 @@ func killConntrackByDst(dest net.IPNet) (bool, error) {
 		dstStr = dest.IP.String()
 	}
 
-	cmd := exec.Command("conntrack", "-D", "-d", dstStr)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "conntrack", "-D", "-d", dstStr)
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -331,10 +385,9 @@ func listRoutes(c *netlink.Conn, linkIndex int) ([]net.IPNet, error) {
 
 		// Grabbing Prefix (CIDR/subnet) Limit applied on exact routes natively
 		dstLen := m.Data[1]
-
-		// Skip system routes
+		table := m.Data[4]
 		protocol := m.Data[5]
-		if protocol == unix.RTPROT_KERNEL {
+		if table != unix.RT_TABLE_MAIN || protocol == unix.RTPROT_KERNEL {
 			continue
 		}
 
@@ -360,4 +413,169 @@ func listRoutes(c *netlink.Conn, linkIndex int) ([]net.IPNet, error) {
 		}
 	}
 	return res, nil
+}
+
+// --- Failover / Health check logic ---
+
+func registerEndpointIP(ip net.IP) {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return
+	}
+	for _, existing := range endpointIPs {
+		if existing.Equal(ip4) {
+			return
+		}
+	}
+	endpointIPs = append(endpointIPs, ip4)
+}
+
+func overlapsEndpoint(prefix net.IPNet) bool {
+	for _, epIP := range endpointIPs {
+		if prefix.Contains(epIP) {
+			return true
+		}
+	}
+	return false
+}
+
+func tunnelLabel(t *Tunnel) string {
+	if t.ConfigPath != "" {
+		return t.ConfigPath
+	}
+	return t.Name
+}
+
+func probeTunnel(parentCtx context.Context, t *Tunnel, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+
+	dialer := net.Dialer{
+		Timeout: timeout / time.Duration(len(probeHosts)),
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sockErr error
+			err := c.Control(func(fd uintptr) {
+				sockErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, t.Name)
+			})
+			if err != nil {
+				return err
+			}
+			return sockErr
+		},
+	}
+	for _, host := range probeHosts {
+		conn, err := dialer.DialContext(ctx, "tcp4", host+":443")
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+	}
+	return false
+}
+
+// moveRoutesLocked moves our routes from one dnsrN to another. Only routes the kernel actually
+// holds on `from` are touched: proxyIPset may also contain prefixes owned by foreign routes (EEXIST)
+func moveRoutesLocked(from, to int) int {
+	c, err := netlink.Dial(unix.NETLINK_ROUTE, nil)
+	if err != nil {
+		log.Printf(red("Error:")+" dialing netlink for route replacement: %v", err)
+		return 0
+	}
+	defer c.Close()
+
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	prefixes, err := listRoutes(c, from)
+	if err != nil {
+		log.Printf(red("Error:")+" can't read netlink routes: %v", err)
+		return 0
+	}
+
+	updated := 0
+	for _, prefix := range prefixes {
+		_ = c.SetDeadline(time.Now().Add(1 * time.Second))
+		err := sendRouteRequest(c, unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_REPLACE|unix.NLM_F_ACK, to, prefix)
+		if err == nil || errors.Is(err, unix.EEXIST) {
+			updated++
+		} else if args.Verbose {
+			log.Printf(yellow("Failed to replace route %s: %v"), prefix.String(), err)
+		}
+	}
+	return updated
+}
+
+func switchActiveTunnel(newTun *Tunnel) {
+	netlinkMu.Lock()
+	oldTun := activeTunnel
+	if oldTun == newTun {
+		netlinkMu.Unlock()
+		return
+	}
+	activeTunnel = newTun
+	updated := moveRoutesLocked(oldTun.Link.Index, newTun.Link.Index)
+	netlinkMu.Unlock()
+
+	if !args.NoConntrack && oldTun != nil && oldTun.AddressIP != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = exec.CommandContext(ctx, "conntrack", "-D", "-q", oldTun.AddressIP).Run()
+		cancel()
+	}
+
+	log.Printf(green("[FAILOVER] Tunnel %s unreachable: switched active tunnel %s (%s) -> %s (%s) [updated %d routes]"),
+		oldTun.Name, oldTun.Name, tunnelLabel(oldTun), newTun.Name, tunnelLabel(newTun), updated)
+}
+
+func startFailoverMonitor(ctx context.Context) {
+	ticker := time.NewTicker(args.CheckInterval)
+	defer ticker.Stop()
+
+	fails := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		cur := activeTunnel
+		if probeTunnel(ctx, cur, args.CheckTimeout) {
+			if fails > 0 {
+				log.Printf(green("[HEALTH] Active tunnel %s (%s) is healthy again"), cur.Name, tunnelLabel(cur))
+				fails = 0
+			}
+			continue
+		}
+		if ctx.Err() != nil {
+			return
+		}
+
+		fails++
+		log.Printf(yellow("[HEALTH] Active tunnel %s (%s) check failed (%d/%d)"),
+			cur.Name, tunnelLabel(cur), fails, args.FailThreshold)
+
+		if fails < args.FailThreshold {
+			continue
+		}
+
+		var next *Tunnel
+		for _, cand := range tunnels {
+			if cand != cur && probeTunnel(ctx, cand, args.CheckTimeout) {
+				next = cand
+				break
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
+
+		if next != nil {
+			fails = 0
+			switchActiveTunnel(next)
+		} else {
+			log.Printf(red("[FAILOVER] Tunnel %s (%s) is unreachable and no healthy standby tunnel was found!"),
+				cur.Name, tunnelLabel(cur))
+		}
+	}
 }

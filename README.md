@@ -15,6 +15,7 @@ A simple yet powerful tool that automatically routes your traffic through VPN fo
 - 🚀 **Smart Routing**: Only routes specified websites through VPN, keeping other traffic direct
 - ⚡ Lightweight: Minimal resource usage with maximum efficiency
 - 🔧 Built-in WireGuard and AmneziaWG support (can automatically set up from config)
+- 🔁 **Multi-Tunnel Failover**: Pass multiple configs or interfaces for automatic backup switching
 - 🛡️ Optional domain blocking
 - 🔄 Auto-cleanup on exit
 - 📝 Support for OpenVPN, WireGuard, AmneziaWG, or any other network interface
@@ -38,10 +39,13 @@ A simple yet powerful tool that automatically routes your traffic through VPN fo
 
    # Using AmneziaWG config (automatic setup)
    sudo ./dnsr ~/my-amnezia.conf
+
+   # Multiple configs with automatic failover (primary + backup)
+   sudo ./dnsr ~/primary-wg.conf ~/backup-awg.conf
    
-   # Or using any existing network interface
-   sudo ./dnsr --interface tun0    # OpenVPN interface
-   sudo ./dnsr --interface wg0     # WireGuard interface
+   # Or using existing network interface(s)
+   sudo ./dnsr --interface tun0            # Single OpenVPN interface
+   sudo ./dnsr -i wg0 -i wg1               # Multiple interfaces with failover
    ```
 
 That's it! DNSR automatically handles everything else.
@@ -80,22 +84,23 @@ opkg install kmod-nft-queue
 ### Command Line Options
 
 ```
-Usage: dnsr [--interface INTERFACE] [--proxy-list PROXY-LIST] [--block-list BLOCK-LIST] 
-           [--silent] [--verbose] [--no-clear] [WG-CONFIG]
-
-Positional arguments:
-  WG-CONFIG            Path to WireGuard or AmneziaWG configuration file (optional)
+Usage:
+  dnsr [options] <WG/Amnezia Config> [Backup Config...]
+  dnsr [options] -i <InterfaceName> [-i <BackupInterface>...]
 
 Options:
-  --interface, -i      Use existing network interface (OpenVPN, WireGuard, etc.)
-  --proxy-list         Domains to route through specified interface [default: proxy.lst]
-  --block-list         Domains to block [default: blocks.lst]
-  --preset-ips         File with IP addresses to proxy immediately, without waiting for DNS resolution
-  --silent, -s         Don't show when new routes are added
-  --verbose, -v        Enable verbose output
-  --persistent, -p     Keep WG/AWG interface (if created) and routes after exit
-  --help, -h           Show this help message
-  --version            Show version
+  -i, --interface strings         Use existing WireGuard/Amnezia interface(s)
+      --proxy-list string         File with list of domains to proxy (default "proxy.lst")
+      --block-list string         File with list of domains to block (default "blocks.lst")
+      --preset-ips string         File with IP addresses to proxy immediately (default "ips.lst")
+  -f, --force                     Force remove existing dnsr interface(s)
+  -s, --silent                    Don't show when new routes are added
+  -v, --verbose                   Enable verbose output
+  -p, --persistent                Keep interface (if created) and routes after exit
+      --no-conntrack              Disable dropping active connections via conntrack
+      --check-interval duration   Health check interval when multiple tunnels are used (default 10s)
+      --check-timeout duration    Health check timeout per tunnel (default 3s)
+      --fail-threshold int        Consecutive health check failures before switching tunnel (default 3)
 
 Multiple proxy/block/ips lists can be specified using semicolon (;)
 Example: proxy1.lst;proxy2.lst;proxy3.lst

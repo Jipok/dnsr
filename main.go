@@ -16,44 +16,57 @@ import (
 )
 
 const (
-	NFQUEUE        = 2034
-	INTERFACE_NAME = "dnsr0"
-	APP_VERSION    = "dnsr 5.1.1"
+	NFQUEUE     = 2034
+	APP_VERSION = "dnsr 5.2.0"
 )
 
 type Args struct {
-	WGConfig    string
-	Interface   string
-	ProxyList   string
-	BlockList   string
-	PresetIPs   string
-	Force       bool
-	Silent      bool
-	Verbose     bool
-	Persistent  bool
-	NoConntrack bool
+	WGConfigs     []string
+	Interfaces    []string
+	ProxyList     string
+	BlockList     string
+	PresetIPs     string
+	Force         bool
+	Silent        bool
+	Verbose       bool
+	Persistent    bool
+	NoConntrack   bool
+	CheckInterval time.Duration
+	CheckTimeout  time.Duration
+	FailThreshold int
+}
+
+type Tunnel struct {
+	Name       string
+	ConfigPath string // empty for external interfaces (-i)
+	AddressIP  string
+	Link       *net.Interface
+	AWGProcess *os.Process
 }
 
 var (
-	args       Args
-	useNFT     bool
-	link       *net.Interface
-	awgProcess *os.Process
+	args    Args
+	useNFT  bool
+	tunnels []*Tunnel
 )
 
 func main() {
 	// Configure flags using pflag
-	flag.StringVarP(&args.Interface, "interface", "i", "", "Use existing WireGuard/Amnezia interface")
+	flag.StringSliceVarP(&args.Interfaces, "interface", "i", nil, "Use existing WireGuard/Amnezia interface(s)")
 
 	flag.StringVar(&args.ProxyList, "proxy-list", "proxy.lst", "File with list of domains to proxy")
 	flag.StringVar(&args.BlockList, "block-list", "blocks.lst", "File with list of domains to block")
 	flag.StringVar(&args.PresetIPs, "preset-ips", "ips.lst", "File with IP addresses to proxy immediately")
 
-	flag.BoolVarP(&args.Force, "force", "f", false, "Force remove existing dnsr interface")
+	flag.BoolVarP(&args.Force, "force", "f", false, "Force remove existing dnsr interface(s)")
 	flag.BoolVarP(&args.Silent, "silent", "s", false, "Don't show when new routes are added")
 	flag.BoolVarP(&args.Verbose, "verbose", "v", false, "Enable verbose output")
 	flag.BoolVarP(&args.Persistent, "persistent", "p", false, "Keep interface (if created) and routes after exit")
 	flag.BoolVar(&args.NoConntrack, "no-conntrack", false, "Disable dropping active connections via conntrack")
+
+	flag.DurationVar(&args.CheckInterval, "check-interval", 10*time.Second, "Health check interval when multiple tunnels are used")
+	flag.DurationVar(&args.CheckTimeout, "check-timeout", 3*time.Second, "Health check timeout per tunnel")
+	flag.IntVar(&args.FailThreshold, "fail-threshold", 3, "Consecutive health check failures before switching tunnel")
 
 	// Disable sorting to keep logical grouping defined above
 	flag.CommandLine.SortFlags = false
@@ -61,38 +74,34 @@ func main() {
 	flag.Usage = func() {
 		fmt.Printf("%s\n\n", APP_VERSION)
 
-		// Improved usage block: shows two distinct modes immediately
 		fmt.Println("Usage:")
-		fmt.Printf("  %s [options] <WG/Amnezia Config>\n", os.Args[0])
-		fmt.Printf("  %s [options] -i <InterfaceName>\n\n", os.Args[0])
+		fmt.Printf("  %s [options] <WG/Amnezia Config> [Backup Config...]\n", os.Args[0])
+		fmt.Printf("  %s [options] -i <InterfaceName> [-i <BackupInterface>...]\n\n", os.Args[0])
 
 		fmt.Println("Options:")
 		flag.PrintDefaults()
 
 		fmt.Println("\nExamples:")
 		fmt.Println(green("  sudo " + os.Args[0] + " ~/wg0.conf"))
-		fmt.Println(green("  sudo " + os.Args[0] + " ~/awg.conf --verbose"))
-		fmt.Println(green("  sudo " + os.Args[0] + " -i wg0"))
+		fmt.Println(green("  sudo " + os.Args[0] + " ~/wg0.conf ~/awg1.conf --verbose"))
+		fmt.Println(green("  sudo " + os.Args[0] + " -i wg0 -i wg1"))
 	}
 
 	flag.Parse()
 
-	// Positional argument handling (Config file)
-	if flag.NArg() > 0 {
-		args.WGConfig = flag.Arg(0)
-	}
+	args.WGConfigs = flag.Args()
 
 	// Validate
-	if args.WGConfig != "" && args.Interface != "" {
-		log.Fatal(red("Mutually exclusive options: use either config file or -i flag"))
-	}
-	if args.WGConfig == "" && args.Interface == "" {
-		println(red("Required: ") + "specify either WireGuard/Amnezia config file or existing interface with -i flag")
+	if len(args.WGConfigs) == 0 && len(args.Interfaces) == 0 {
+		println(red("Required: ") + "specify either WireGuard/Amnezia config file(s) or existing interface(s) with -i flag")
 		println("EXAMPLE:")
 		println(green("  sudo ./dnsr ~/my-wireguard.conf"))
 		println("OR")
 		println(green("  sudo ./dnsr --interface wg0"))
 		os.Exit(1)
+	}
+	if args.CheckInterval <= 0 || args.CheckTimeout <= 0 || args.FailThreshold < 1 {
+		log.Fatal(red("Invalid health check parameters: interval and timeout must be > 0, fail-threshold must be >= 1"))
 	}
 
 	if args.ProxyList == "proxy.lst" && !fileExists(args.ProxyList) {
@@ -181,59 +190,58 @@ func main() {
 		fmt.Println("Silent mode, run without -s for verbose output")
 	}
 
-	// Check for existing interface
-	link, err = net.InterfaceByName(INTERFACE_NAME)
-	if err == nil && args.Interface != INTERFACE_NAME {
-		log.Printf(yellow("An existing `%s` interface was found."), INTERFACE_NAME)
-		log.Print(yellow("This could be because:"))
-		log.Print(yellow(" - Previous process was terminated incorrectly"))
-		log.Print(yellow(" - Interface was preserved with --persistent flag"))
-		if args.Force {
-			log.Print("Removing existing interface as --force flag is set")
-			removeWireguard(true)
-			removeNfqueue()
-			log.Print(green("Cleanup completed. Proceeding with normal startup\n"))
-		} else {
-			log.Print(red("To proceed, either:"))
-			log.Print(" - Use --force to remove existing interface and create new one")
-			log.Printf(" - Use -i %s to use existing interface", INTERFACE_NAME)
-			log.Fatalf(" - Or manually remove interface with: ip link delete %s", INTERFACE_NAME)
+	// Build tunnel list
+	for i, cfgPath := range args.WGConfigs {
+		tunnels = append(tunnels, &Tunnel{
+			Name:       fmt.Sprintf("dnsr%d", i),
+			ConfigPath: cfgPath,
+		})
+	}
+	for _, ifName := range args.Interfaces {
+		tunnels = append(tunnels, &Tunnel{Name: ifName})
+	}
+
+	// Check for existing dnsrN interfaces when creating from config
+	if len(args.WGConfigs) > 0 {
+		existing := findExistingDnsrInterfaces()
+		if len(existing) > 0 {
+			log.Printf(yellow("Existing interface(s) found: %s"), strings.Join(existing, ", "))
+			log.Print(yellow("This could be because:"))
+			log.Print(yellow(" - Previous process was terminated incorrectly"))
+			log.Print(yellow(" - Interface was preserved with --persistent flag"))
+			if args.Force {
+				log.Print("Removing existing interface(s) as --force flag is set")
+				cleanupExistingInterfaces(existing)
+				log.Print(green("Cleanup completed. Proceeding with normal startup\n"))
+			} else {
+				log.Print(red("To proceed, either:"))
+				log.Print(" - Use --force to remove existing interface(s) and create new one(s)")
+				log.Printf(" - Use -i %s to use existing interface(s)", strings.Join(existing, " -i "))
+				log.Fatalf(" - Or manually remove with: ip link delete %s", existing[0])
+			}
 		}
 	}
 
-	// Configure interface
-	if args.WGConfig != "" {
-		setupWireguard()
-		defer removeWireguard(false)
-	} else {
-		link, err = net.InterfaceByName(args.Interface)
-		if err != nil {
-			log.Fatalf(red("Error:")+" getting `%s` interface: %v", args.Interface, err)
-		}
-		setUpMasquerade(args.Interface)
-		log.Printf(green("Using `%s` interface"), args.Interface)
-	}
+	// Configure tunnel interfaces
+	setupTunnels()
+	defer removeTunnels()
 
 	setupRouting()
 
 	setupNfqueue()
 
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	if len(tunnels) > 1 {
+		go startFailoverMonitor(monitorCtx)
+	}
+
 	fmt.Println("====================")
 	<-sigChan
 	log.Println("Shutting down...")
 
+	monitorCancel()
 	removeNfqueue()
 	cleanupRouting()
-
-	if args.Interface != "" {
-		// Remove MASQUERADE rule
-		if useNFT {
-			execCommand("nft delete table ip dnsr-nat")
-		} else {
-			execCommand(fmt.Sprintf("iptables -t nat -D POSTROUTING -o %s -j MASQUERADE", args.Interface))
-			execCommand(fmt.Sprintf("iptables -t mangle -D FORWARD -o %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1340", args.Interface))
-		}
-	}
 }
 
 ///////////////////////////////////////////////////////////////////////////////

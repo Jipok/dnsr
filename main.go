@@ -118,10 +118,9 @@ func main() {
 
 	if args.PresetIPs == "ips.lst" && !fileExists(args.PresetIPs) {
 		if !args.Silent {
-			log.Print(yellow("Notice: Consider routing CDN IPs (like Cloudflare) and DNS through the VPN."))
-			log.Print(yellow("Many blocked websites are hosted on Cloudflare, and DPI systems often drop these connections."))
-			log.Print(green("  wget https://www.cloudflare.com/ips-v4 -O ips.lst"))
-			log.Print(green("  echo -e '\\n8.8.8.8\\n8.8.4.4\\n1.1.1.1' >> ips.lst\n"))
+			log.Print(yellow("Notice: Consider routing CDN IPs (Cloudflare, Vercel, Fastly, Telegram, Discord) and DNS through the VPN."))
+			log.Print(yellow("Many websites are hosted on CDNs where DPI throttles connections after 16 KB by IP range."))
+			log.Print(green("  wget https://github.com/Jipok/dnsr/raw/refs/heads/master/ips.lst -O ips.lst\n"))
 		}
 		args.PresetIPs = ""
 	}

@@ -1,0 +1,92 @@
+# ==============================================================================
+# DNSR Preset IP List (ips.lst)
+# Routes traffic to these IPv4 addresses/subnets directly through the VPN tunnel
+# without waiting for domain-name matching (fixes direct-IP apps and TSPU 16KB
+# TCP throttling on major foreign CDNs).
+# ==============================================================================
+
+# Public DNS resolvers (prevent ISP DNS hijacking/spoofing)
+8.8.8.8
+8.8.4.4
+1.1.1.1
+1.0.0.1
+9.9.9.9
+149.112.112.112
+94.140.14.14
+94.140.15.15
+208.67.222.222
+208.67.220.220
+
+# Telegram (AS62041, AS62014, AS59930, AS44907 - connects directly by IP)
+91.108.4.0/22
+91.108.8.0/22
+91.108.12.0/22
+91.108.16.0/22
+91.108.20.0/22
+91.108.56.0/22
+91.105.192.0/23
+149.154.160.0/20
+185.76.151.0/24
+
+# Discord Voice / RTC (AS49544 i3D.net UDP media servers)
+66.22.192.0/18
+138.128.136.0/21
+
+# Cloudflare CDN (AS13335 - TSPU 16KB TCP cap & ECH blocking)
+173.245.48.0/20
+103.21.244.0/22
+103.22.200.0/22
+103.31.4.0/22
+141.101.64.0/18
+108.162.192.0/18
+190.93.240.0/20
+188.114.96.0/20
+197.234.240.0/22
+198.41.128.0/17
+162.158.0.0/15
+104.16.0.0/13
+104.24.0.0/14
+172.64.0.0/13
+131.0.72.0/22
+
+# Vercel Anycast CDN (VERCEL-01..12 - TSPU 16KB TCP cap on custom domains)
+64.29.17.0/24
+64.239.109.0/24
+64.239.123.0/24
+66.33.60.0/24
+76.76.21.0/24
+198.169.1.0/24
+198.169.2.0/24
+216.150.1.0/24
+216.150.16.0/24
+216.198.79.0/24
+216.230.84.0/24
+216.230.86.0/24
+
+# Fastly CDN (AS54113) — commented out by default because Fastly works directly
+# on most ISPs and serves heavy traffic (PyPI/pip, Flathub, deb.debian.org).
+# Uncomment if your ISP throttles Fastly:
+# 23.235.32.0/20
+# 43.249.72.0/22
+# 103.244.50.0/24
+# 103.245.222.0/23
+# 103.245.224.0/24
+# 104.156.80.0/20
+# 140.248.64.0/18
+# 140.248.128.0/17
+# 146.75.0.0/17
+# 151.101.0.0/16
+# 157.52.64.0/18
+# 167.82.0.0/17
+# 167.82.128.0/20
+# 167.82.160.0/20
+# 167.82.224.0/20
+# 172.111.64.0/18
+# 185.31.16.0/22
+# 199.27.72.0/21
+# 199.232.0.0/16
+
+# AWS eu-central-1 & us-east-2 (Photon Multiplayer master/relay, game backends)
+3.64.0.0/12
+18.192.0.0/13
+13.56.0.0/14

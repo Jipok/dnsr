@@ -23,9 +23,12 @@ A simple yet powerful tool that automatically routes your traffic through VPN fo
 ## Quick Start (2 Minutes Setup)
 
 1. Download the [latest release](https://github.com/Jipok/dnsr/releases/latest) or build from source
-2. Prepare your domain lists:
+2. Prepare your domain and IP lists:
    ```bash
-   # For proxy list (recommended)
+   # Preset IPs for CDNs/services throttled by IP (Cloudflare, Vercel, Fastly, Telegram, Discord, DNS)
+   wget https://github.com/Jipok/dnsr/raw/refs/heads/master/ips.lst -O ips.lst
+
+   # For proxy domain list (recommended)
    wget https://github.com/1andrevich/Re-filter-lists/raw/refs/heads/main/domains_all.lst -O proxy.lst
    
    # For block list (optional)
